@@ -22,6 +22,7 @@ from cs336_alignment.modal_utils import (
 app = modal.App(f"cs336-a5-supplement-{SUNET_ID}")
 
 SHARED_VOLUME_NAME = "cs336-a5-supplement"
+SHARED_VOLUME_ENVIRONMENT = "cs336-shcao"
 SHARED_VOLUME_MOUNT_PATH = "/mnt/cs336-a5-supplement"
 RESULTS_VOLUME_NAME = f"cs336-a5-supplement-results-{SUNET_ID}"
 RESULTS_VOLUME_MOUNT_PATH = "/mnt/cs336-a5-supplement-results"
@@ -35,7 +36,10 @@ SFT_TRAIN_PATH = f"{SFT_DATA_DIR}/train.jsonl.gz"
 SFT_DEV_PATH = f"{SFT_DATA_DIR}/test.jsonl.gz"
 RUN_TIMEOUT_SECONDS = 20 * 60 * 60
 
-shared_volume = modal.Volume.from_name(SHARED_VOLUME_NAME)
+shared_volume = modal.Volume.from_name(
+    SHARED_VOLUME_NAME,
+    environment_name=SHARED_VOLUME_ENVIRONMENT,
+)
 results_volume = modal.Volume.from_name(RESULTS_VOLUME_NAME, create_if_missing=True)
 VOLUME_MOUNTS = {
     SHARED_VOLUME_MOUNT_PATH: shared_volume,
