@@ -46,7 +46,29 @@ def run_tokenize_prompt_and_output(
                 with labels, with value 1 where the corresponding label token
                 is part of the response and 0 otherwise.
     """
-    raise NotImplementedError
+    prompt_tokens = tokenizer.encode(prompt_strs)
+    output_tokens = tokenizer.encode(output_strs)
+    input_ids = list()
+    labels = list()
+    response_mask = list()
+    # Construct the correct prompt_and_output concatenated sequence first
+    for prompt, output in zip(prompt_tokens, output_tokens):
+        input_ids.append(prompt + output)  # We would shift 1 position at the end when returning
+        labels.append(prompt + output)  # We would shift 1 position at the end when returning
+        response_mask.append([0] * len(prompt) + [1] * len(output))  # We would shift 1 position at the end when returning
+    # Padding later
+    max_seq_len = max(map(len, input_ids))
+    for i in range(len(input_ids)):
+        padding_len = max_seq_len - len(input_ids[i])
+        if padding_len > 0:
+            input_ids[i] += [tokenizer.pad_token_id] * padding_len
+            labels[i] += [tokenizer.pad_token_id] * padding_len
+            response_mask[i] += [0] * padding_len
+    return {
+        "input_ids": torch.tensor(input_ids, dtype=torch.long)[:, :-1],
+        "labels": torch.tensor(labels, dtype=torch.long)[:, 1:],
+        "response_mask": torch.tensor(response_mask, dtype=torch.long)[:, 1:]
+    }
 
 
 def run_get_response_log_probs(
