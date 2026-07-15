@@ -46,27 +46,24 @@ def run_tokenize_prompt_and_output(
                 with labels, with value 1 where the corresponding label token
                 is part of the response and 0 otherwise.
     """
-    prompt_tokens = tokenizer.encode(prompt_strs)
-    output_tokens = tokenizer.encode(output_strs)
-    input_ids = list()
-    labels = list()
+    prompt_tokens = tokenizer(prompt_strs, add_special_tokens=False)["input_ids"]
+    output_tokens = tokenizer(output_strs, add_special_tokens=False)["input_ids"]
+    sequences = list()
     response_mask = list()
     # Construct the correct prompt_and_output concatenated sequence first
     for prompt, output in zip(prompt_tokens, output_tokens):
-        input_ids.append(prompt + output)  # We would shift 1 position at the end when returning
-        labels.append(prompt + output)  # We would shift 1 position at the end when returning
+        sequences.append(prompt + output)  # We would shift 1 position at the end when returning
         response_mask.append([0] * len(prompt) + [1] * len(output))  # We would shift 1 position at the end when returning
     # Padding later
-    max_seq_len = max(map(len, input_ids))
-    for i in range(len(input_ids)):
-        padding_len = max_seq_len - len(input_ids[i])
+    max_seq_len = max(len(sequence) for sequence in sequences)
+    for i in range(len(sequences)):
+        padding_len = max_seq_len - len(sequences[i])
         if padding_len > 0:
-            input_ids[i] += [tokenizer.pad_token_id] * padding_len
-            labels[i] += [tokenizer.pad_token_id] * padding_len
+            sequences[i] += [tokenizer.pad_token_id] * padding_len
             response_mask[i] += [0] * padding_len
     return {
-        "input_ids": torch.tensor(input_ids, dtype=torch.long)[:, :-1],
-        "labels": torch.tensor(labels, dtype=torch.long)[:, 1:],
+        "input_ids": torch.tensor(sequences, dtype=torch.long)[:, :-1],
+        "labels": torch.tensor(sequences, dtype=torch.long)[:, 1:],
         "response_mask": torch.tensor(response_mask, dtype=torch.long)[:, 1:]
     }
 
