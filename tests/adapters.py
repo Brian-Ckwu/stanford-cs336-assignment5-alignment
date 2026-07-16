@@ -101,7 +101,29 @@ def run_get_response_log_probs(
                 entropy for each position (present only if
                 return_token_entropy=True).
     """
-    raise NotImplementedError
+    outputs = dict()
+    logits = model(input_ids).logits
+    # ===== Implementation 1 =====
+    # NOTE: logits must be normalized with before they become log-probs.
+    all_log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+    label_log_probs = all_log_probs.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
+    outputs["log_probs"] = label_log_probs
+    if return_token_entropy:
+        outputs["token_entropy"] = -(all_log_probs.exp() * all_log_probs).sum(-1)
+    # ===== End of Implementation 1 =====
+    # # ===== Implementation 2: originally done for better memory efficiency, but it turns out slower empirically (might be due to optimized kernel used in Implmenetation 1) =====
+    #     # NOTE: logits must be normalized with before they become log-probs.
+    # if return_token_entropy:
+    #     all_log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+    #     label_log_probs = all_log_probs.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
+    #     outputs["log_probs"] = label_log_probs
+    #     outputs["token_entropy"] = -(all_log_probs.exp() * all_log_probs).sum(-1)
+    # else:  # NOTE: we avoid materializing all log-probs, but still compute the full-vocab normalizer
+    #     label_logits = logits.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
+    #     normalizing_logits = logits.logsumexp(dim=-1) # NOTE: it is calculating max_logits + log(sum(exp(logits - max_logits))) under the hood
+    #     outputs["log_probs"] = label_logits - normalizing_logits
+    # # ===== End of Implementation 2 =====
+    return outputs
 
 
 def run_compute_rollout_rewards(
