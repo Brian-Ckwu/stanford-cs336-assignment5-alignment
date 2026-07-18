@@ -205,7 +205,28 @@ def run_compute_group_normalized_rewards(
                 your choice of other statistics to log (e.g. mean, std, max/min
                 of rewards).
     """
-    raise NotImplementedError
+    n_prompts = len(raw_rewards) / group_size
+    assert n_prompts.is_integer()
+    advantages = torch.empty(len(raw_rewards))
+    for i in range(int(n_prompts)):
+        group_rewards = raw_rewards[i * group_size : (i + 1) * group_size]
+        match baseline:
+            case "mean":
+                b = torch.mean(group_rewards)
+            case "none":
+                b = 0
+            case _:
+                raise ValueError(f"baseline value {baseline} not supported")
+        match advantage_normalizer:
+            case "std":
+                normalizer = torch.std(group_rewards) + advantage_eps
+            case "none":
+                normalizer = 1.0
+            case "mean":
+                normalizer = torch.mean(group_rewards) + advantage_eps
+        advantages[i * group_size : (i + 1) * group_size] = (group_rewards - b) / normalizer
+    metadata = dict()  # TODO: implement required metadata in the future
+    return advantages, metadata
 
 
 def run_compute_policy_gradient_loss(
