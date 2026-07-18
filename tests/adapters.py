@@ -320,7 +320,15 @@ def run_aggregate_loss_across_microbatch(
             A scalar containing the average loss. Make sure you can later call
             backward on this loss.
     """
-    raise NotImplementedError
+    assert per_token_policy_gradient_loss.shape == mask.shape
+    masked_loss = mask * per_token_policy_gradient_loss  # shape = (batch_size, sequence_length)
+    match loss_normalization:
+        case "sequence":
+            normalized_loss_of_each_sequence = masked_loss.sum(dim=-1) / mask.sum(dim=-1)
+            avg_loss = normalized_loss_of_each_sequence.sum() / masked_loss.shape[0]  # NOTE: remember to normalize by batch_size (i.e., B * G)
+        case "constant":
+            raise NotImplementedError
+    return avg_loss
 
 
 def run_grpo_train_step(
