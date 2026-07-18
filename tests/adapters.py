@@ -273,7 +273,22 @@ def run_compute_policy_gradient_loss(
                 Statistics from the underlying loss call, such as
                 clip-fraction components.
     """
-    raise NotImplementedError
+    assert raw_rewards_or_advantages.shape[0] == policy_log_probs.shape[0]
+    if raw_rewards_or_advantages.ndim == 1:
+        raw_rewards_or_advantages = raw_rewards_or_advantages.unsqueeze(-1)
+    # NOTE: since PyTorch optimizers do gradient descent, don't forget to multiply by -1!
+    per_token_policy_gradient_loss = -raw_rewards_or_advantages * policy_log_probs
+    metadata = dict()  # TODO: put in useful information later
+    match importance_reweighting_method:
+        case "none":
+            pass
+        case "noclip":  # TODO: apply importance reweighting without clipping
+            raise NotImplementedError
+        case "grpo":  # TODO: do PPO/GRPO-style token-level reweighting and clipping
+            raise NotImplementedError
+        case "gspo":  # TODO: do GSPO-style sequence-level reweighting and clipping
+            raise NotImplementedError
+    return per_token_policy_gradient_loss, metadata
 
 
 def run_aggregate_loss_across_microbatch(
