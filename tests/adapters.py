@@ -417,7 +417,60 @@ def run_grpo_train_step(
                 Dict with metadata from the underlying loss call, gradient norm
                 before clipping, and any other statistics you might want to log.
     """
-    raise NotImplementedError
+    # rewards should be computed outside of the gradient accumulation loop to make calculations of group-level stats (e.g., mean and std) simple
+    raw_rewards, raw_rewards_metadata = run_compute_rollout_rewards(reward_fn, rollout_responses, repeated_ground_truths)
+    advantages, advantages_metadata = run_compute_group_normalized_rewards(raw_rewards, group_size, baseline, advantage_eps, advantage_normalizer)
+    assert len(repeated_prompts) == len(rollout_responses) == len(repeated_ground_truths)
+    batch_size = len(repeated_prompts)
+    microbatch_size = batch_size // gradient_accumulation_steps  # NOTE: it's okay if batch_size / gradient_accumulation_steps is not an integer (see the note below)
+    # Gradient accumulation across microbatches
+    loss = torch.tensor(0.0)
+    avg_entropy = torch.tensor(0.0)  # TODO: check why this information might be useful and whether my implementation is reasonable
+    for i in range(gradient_accumulation_steps):
+        # Get the data related to this microbatch
+        prompts = repeated_prompts[i*microbatch_size:(i+1)*microbatch_size]
+        responses = rollout_responses[i*microbatch_size:(i+1)*microbatch_size]
+        microbatch_advantages = advantages[i*microbatch_size:(i+1)*microbatch_size]
+        microbatch_old_log_probs = old_log_probs[i*microbatch_size:(i+1)*microbatch_size] if old_log_probs else None
+        # Tokenization (on CPU)
+        tokenized = run_tokenize_prompt_and_output(prompts, responses, tokenizer)  # a dict with keys "input_ids", "labels", and "response_mask"
+        # Get each prefix-conditioned response token's logprob (and optionally entropy), which is necessary for computing policy gradients
+        model_device = next(model.parameters()).device  # NOTE: this assume that all parameters of the model are on the same GPU
+        response_token_logprobs = run_get_response_log_probs(  # two keys: ["log_probs", "token_entropy"], shape of the logprobs: (microbatch_size, max_sequence_length_in_this_microbatch)
+            model,
+            input_ids=tokenized["input_ids"].to(model_device),
+            labels=tokenized["labels"].to(model_device),  # Remember to move the tokenized data to the same device as the model
+            return_token_entropy=True
+        )
+        avg_entropy += response_token_logprobs["token_entropy"].mean() * (len(prompts) / batch_size)
+        # Compute policy-gradient loss
+        per_token_loss, per_token_loss_metadata = run_compute_policy_gradient_loss(
+            raw_rewards_or_advantages=microbatch_advantages,
+            policy_log_probs=response_token_logprobs["log_probs"],
+            importance_reweighting_method=importance_reweighting_method,
+            old_log_probs=microbatch_old_log_probs,
+            cliprange=cliprange,
+            response_mask=tokenized["response_mask"]
+        )
+        microbatch_loss = run_aggregate_loss_across_microbatch(
+            per_token_policy_gradient_loss=per_token_loss,
+            mask=tokenized["response_mask"],
+            loss_normalization=loss_normalization,
+            normalization_constant=normalization_constant
+        ) * (per_token_loss.shape[0] / batch_size)  # NOTE: Important!!! Remember to rescale the loss to make the accumulated loss equivalent to the full-batch loss
+        microbatch_loss.backward()
+        loss += microbatch_loss.detach()
+
+    total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+    optimizer.step()
+    optimizer.zero_grad()
+    metadata={
+        "gradient_norm": total_norm,
+        "token_entropy": avg_entropy,
+        "mean_total_reward": raw_rewards_metadata["mean_total_reward"],
+        "mean_format_reward": raw_rewards_metadata["mean_format_reward"],
+    }
+    return loss, metadata
 
 
 """
