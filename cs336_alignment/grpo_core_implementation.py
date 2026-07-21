@@ -436,13 +436,13 @@ def grpo_train_step(
             labels=tokenized["labels"].to(model_device),  # Remember to move the tokenized data to the same device as the model
             return_token_entropy=True
         )
-        avg_entropy += response_token_logprobs["token_entropy"].mean() * (len(prompts) / batch_size)
+        avg_entropy += response_token_logprobs["token_entropy"].mean().detach().cpu() * (len(prompts) / batch_size)
         # Compute policy-gradient loss
         per_token_loss, per_token_loss_metadata = compute_policy_gradient_loss(
-            raw_rewards_or_advantages=microbatch_advantages,
+            raw_rewards_or_advantages=microbatch_advantages.to(model_device),  # NOTE: remember to move to the same device!
             policy_log_probs=response_token_logprobs["log_probs"],
             importance_reweighting_method=importance_reweighting_method,
-            old_log_probs=microbatch_old_log_probs,
+            old_log_probs=microbatch_old_log_probs.to(model_device) if microbatch_old_log_probs else None,
             cliprange=cliprange,
             response_mask=tokenized["response_mask"].to(model_device)
         )
@@ -453,7 +453,7 @@ def grpo_train_step(
             normalization_constant=normalization_constant
         ) * (per_token_loss.shape[0] / batch_size)  # NOTE: Important!!! Remember to rescale the loss to make the accumulated loss equivalent to the full-batch loss
         microbatch_loss.backward()
-        loss += microbatch_loss.detach()
+        loss += microbatch_loss.detach().cpu()
 
     total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
     optimizer.step()
