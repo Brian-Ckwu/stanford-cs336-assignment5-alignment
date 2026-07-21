@@ -1,24 +1,10 @@
-from __future__ import annotations
-
-import os
-from typing import Any, Callable, Literal
+from typing import Callable, Literal
 
 import torch
 from torch import Tensor
-from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizerBase
 
-from cs336_alignment.grpo_core_implementation import (
-    tokenize_prompt_and_output,
-    get_response_log_probs,
-    compute_rollout_rewards,
-    compute_group_normalized_rewards,
-    compute_policy_gradient_loss,
-    aggregate_loss_across_microbatch,
-    grpo_train_step,
-)
-
-def run_tokenize_prompt_and_output(
+def tokenize_prompt_and_output(
     prompt_strs: list[str],
     output_strs: list[str],
     tokenizer: PreTrainedTokenizerBase,
@@ -54,10 +40,29 @@ def run_tokenize_prompt_and_output(
                 with labels, with value 1 where the corresponding label token
                 is part of the response and 0 otherwise.
     """
-    return tokenize_prompt_and_output(prompt_strs, output_strs, tokenizer)
+    prompt_tokens = tokenizer(prompt_strs, add_special_tokens=False)["input_ids"]
+    output_tokens = tokenizer(output_strs, add_special_tokens=False)["input_ids"]
+    sequences = list()
+    response_mask = list()
+    # Construct the correct prompt_and_output concatenated sequence first
+    for prompt, output in zip(prompt_tokens, output_tokens):
+        sequences.append(prompt + output)  # We would shift 1 position at the end when returning
+        response_mask.append([0] * len(prompt) + [1] * len(output))  # We would shift 1 position at the end when returning
+    # Padding later
+    max_seq_len = max(len(sequence) for sequence in sequences)
+    for i in range(len(sequences)):
+        padding_len = max_seq_len - len(sequences[i])
+        if padding_len > 0:
+            sequences[i] += [tokenizer.pad_token_id] * padding_len
+            response_mask[i] += [0] * padding_len
+    return {
+        "input_ids": torch.tensor(sequences, dtype=torch.long)[:, :-1],
+        "labels": torch.tensor(sequences, dtype=torch.long)[:, 1:],
+        "response_mask": torch.tensor(response_mask, dtype=torch.long)[:, 1:]
+    }
 
 
-def run_get_response_log_probs(
+def get_response_log_probs(
     model: torch.nn.Module,
     input_ids: torch.Tensor,
     labels: torch.Tensor,
@@ -90,10 +95,32 @@ def run_get_response_log_probs(
                 entropy for each position (present only if
                 return_token_entropy=True).
     """
-    return get_response_log_probs(model, input_ids, labels, return_token_entropy)
+    outputs = dict()
+    logits = model(input_ids).logits
+    # ===== Implementation 1 =====
+    # NOTE: logits must be normalized with before they become log-probs.
+    all_log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+    label_log_probs = all_log_probs.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
+    outputs["log_probs"] = label_log_probs
+    if return_token_entropy:
+        outputs["token_entropy"] = -(all_log_probs.exp() * all_log_probs).sum(-1)
+    # ===== End of Implementation 1 =====
+    # # ===== Implementation 2: originally done for better memory efficiency, but it turns out slower empirically (might be due to optimized kernel used in Implmenetation 1) =====
+    #     # NOTE: logits must be normalized with before they become log-probs.
+    # if return_token_entropy:
+    #     all_log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+    #     label_log_probs = all_log_probs.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
+    #     outputs["log_probs"] = label_log_probs
+    #     outputs["token_entropy"] = -(all_log_probs.exp() * all_log_probs).sum(-1)
+    # else:  # NOTE: we avoid materializing all log-probs, but still compute the full-vocab normalizer
+    #     label_logits = logits.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
+    #     normalizing_logits = logits.logsumexp(dim=-1) # NOTE: it is calculating max_logits + log(sum(exp(logits - max_logits))) under the hood
+    #     outputs["log_probs"] = label_logits - normalizing_logits
+    # # ===== End of Implementation 2 =====
+    return outputs
 
 
-def run_compute_rollout_rewards(
+def compute_rollout_rewards(
     reward_fn: Callable[[str, str], dict[str, float]],
     rollout_responses: list[str],
     repeated_ground_truths: list[str],
@@ -122,10 +149,21 @@ def run_compute_rollout_rewards(
                 Reward statistics to log. At minimum, include the mean total
                 and format rewards over the rollout batch.
     """
-    return compute_rollout_rewards(reward_fn, rollout_responses, repeated_ground_truths)
+    assert len(rollout_responses) == len(repeated_ground_truths)
+    reward_dicts = [
+        reward_fn(res, gt)
+        for res, gt in zip(rollout_responses, repeated_ground_truths)
+    ]
+    raw_rewards = torch.tensor([reward_dict["reward"] for reward_dict in reward_dicts])
+    format_rewards = torch.tensor([reward_dict["format_reward"] for reward_dict in reward_dicts])
+    metadata = {
+        "mean_total_reward": raw_rewards.mean().item(),
+        "mean_format_reward": format_rewards.mean().item()
+    }
+    return raw_rewards, metadata
 
 
-def run_compute_group_normalized_rewards(
+def compute_group_normalized_rewards(
     raw_rewards: torch.Tensor,
     group_size: int,
     baseline: Literal["mean", "none"] = "mean",
@@ -161,10 +199,31 @@ def run_compute_group_normalized_rewards(
                 your choice of other statistics to log (e.g. mean, std, max/min
                 of rewards).
     """
-    return compute_group_normalized_rewards(raw_rewards, group_size, baseline, advantage_eps, advantage_normalizer)
+    n_prompts = len(raw_rewards) / group_size
+    assert n_prompts.is_integer()
+    advantages = torch.empty(len(raw_rewards))
+    for i in range(int(n_prompts)):
+        group_rewards = raw_rewards[i * group_size : (i + 1) * group_size]
+        match baseline:
+            case "mean":
+                b = torch.mean(group_rewards)
+            case "none":
+                b = 0
+            case _:
+                raise ValueError(f"baseline value {baseline} not supported")
+        match advantage_normalizer:
+            case "std":
+                normalizer = torch.std(group_rewards) + advantage_eps
+            case "none":
+                normalizer = 1.0
+            case "mean":
+                normalizer = torch.mean(group_rewards) + advantage_eps
+        advantages[i * group_size : (i + 1) * group_size] = (group_rewards - b) / normalizer
+    metadata = dict()  # TODO: implement required metadata in the future
+    return advantages, metadata
 
 
-def run_compute_policy_gradient_loss(
+def compute_policy_gradient_loss(
     raw_rewards_or_advantages: torch.Tensor,
     policy_log_probs: torch.Tensor,
     importance_reweighting_method: Literal["none", "noclip", "grpo", "gspo"] = "none",
@@ -208,10 +267,25 @@ def run_compute_policy_gradient_loss(
                 Statistics from the underlying loss call, such as
                 clip-fraction components.
     """
-    return compute_policy_gradient_loss(raw_rewards_or_advantages, policy_log_probs, importance_reweighting_method, old_log_probs, cliprange, response_mask)
+    assert raw_rewards_or_advantages.shape[0] == policy_log_probs.shape[0]
+    if raw_rewards_or_advantages.ndim == 1:
+        raw_rewards_or_advantages = raw_rewards_or_advantages.unsqueeze(-1)
+    # NOTE: since PyTorch optimizers do gradient descent, don't forget to multiply by -1!
+    per_token_policy_gradient_loss = -raw_rewards_or_advantages * policy_log_probs
+    metadata = dict()  # TODO: put in useful information later
+    match importance_reweighting_method:
+        case "none":
+            pass
+        case "noclip":  # TODO: apply importance reweighting without clipping
+            raise NotImplementedError
+        case "grpo":  # TODO: do PPO/GRPO-style token-level reweighting and clipping
+            raise NotImplementedError
+        case "gspo":  # TODO: do GSPO-style sequence-level reweighting and clipping
+            raise NotImplementedError
+    return per_token_policy_gradient_loss, metadata
 
 
-def run_aggregate_loss_across_microbatch(
+def aggregate_loss_across_microbatch(
     per_token_policy_gradient_loss: torch.Tensor,
     mask: torch.Tensor,
     loss_normalization: Literal["sequence", "constant"] = "sequence",
@@ -240,10 +314,18 @@ def run_aggregate_loss_across_microbatch(
             A scalar containing the average loss. Make sure you can later call
             backward on this loss.
     """
-    return aggregate_loss_across_microbatch(per_token_policy_gradient_loss, mask, loss_normalization, normalization_constant)
+    assert per_token_policy_gradient_loss.shape == mask.shape
+    masked_loss = mask * per_token_policy_gradient_loss  # shape = (batch_size, sequence_length)
+    match loss_normalization:
+        case "sequence":
+            normalized_loss_of_each_sequence = masked_loss.sum(dim=-1) / mask.sum(dim=-1)
+            avg_loss = normalized_loss_of_each_sequence.sum() / masked_loss.shape[0]  # NOTE: remember to normalize by batch_size (i.e., B * G)
+        case "constant":
+            raise NotImplementedError
+    return avg_loss
 
 
-def run_grpo_train_step(
+def grpo_train_step(
     model: torch.nn.Module,
     tokenizer: PreTrainedTokenizerBase,
     optimizer: torch.optim.Optimizer,
@@ -329,141 +411,57 @@ def run_grpo_train_step(
                 Dict with metadata from the underlying loss call, gradient norm
                 before clipping, and any other statistics you might want to log.
     """
-    return grpo_train_step(model, tokenizer, optimizer, gradient_accumulation_steps, max_grad_norm, reward_fn, repeated_prompts, rollout_responses, repeated_ground_truths, group_size, baseline, advantage_eps, advantage_normalizer, importance_reweighting_method, old_log_probs, cliprange, loss_normalization, normalization_constant)
+    # rewards should be computed outside of the gradient accumulation loop to make calculations of group-level stats (e.g., mean and std) simple
+    raw_rewards, raw_rewards_metadata = compute_rollout_rewards(reward_fn, rollout_responses, repeated_ground_truths)
+    advantages, advantages_metadata = compute_group_normalized_rewards(raw_rewards, group_size, baseline, advantage_eps, advantage_normalizer)
+    assert len(repeated_prompts) == len(rollout_responses) == len(repeated_ground_truths)
+    batch_size = len(repeated_prompts)
+    microbatch_size = batch_size // gradient_accumulation_steps  # NOTE: it's okay if batch_size / gradient_accumulation_steps is not an integer (see the note below)
+    # Gradient accumulation across microbatches
+    loss = torch.tensor(0.0)
+    avg_entropy = torch.tensor(0.0)  # TODO: check why this information might be useful and whether my implementation is reasonable
+    for i in range(gradient_accumulation_steps):
+        # Get the data related to this microbatch
+        prompts = repeated_prompts[i*microbatch_size:(i+1)*microbatch_size]
+        responses = rollout_responses[i*microbatch_size:(i+1)*microbatch_size]
+        microbatch_advantages = advantages[i*microbatch_size:(i+1)*microbatch_size]
+        microbatch_old_log_probs = old_log_probs[i*microbatch_size:(i+1)*microbatch_size] if old_log_probs else None
+        # Tokenization (on CPU)
+        tokenized = tokenize_prompt_and_output(prompts, responses, tokenizer)  # a dict with keys "input_ids", "labels", and "response_mask"
+        # Get each prefix-conditioned response token's logprob (and optionally entropy), which is necessary for computing policy gradients
+        model_device = next(model.parameters()).device  # NOTE: this assume that all parameters of the model are on the same GPU
+        response_token_logprobs = get_response_log_probs(  # two keys: ["log_probs", "token_entropy"], shape of the logprobs: (microbatch_size, max_sequence_length_in_this_microbatch)
+            model,
+            input_ids=tokenized["input_ids"].to(model_device),
+            labels=tokenized["labels"].to(model_device),  # Remember to move the tokenized data to the same device as the model
+            return_token_entropy=True
+        )
+        avg_entropy += response_token_logprobs["token_entropy"].mean() * (len(prompts) / batch_size)
+        # Compute policy-gradient loss
+        per_token_loss, per_token_loss_metadata = compute_policy_gradient_loss(
+            raw_rewards_or_advantages=microbatch_advantages,
+            policy_log_probs=response_token_logprobs["log_probs"],
+            importance_reweighting_method=importance_reweighting_method,
+            old_log_probs=microbatch_old_log_probs,
+            cliprange=cliprange,
+            response_mask=tokenized["response_mask"].to(model_device)
+        )
+        microbatch_loss = aggregate_loss_across_microbatch(
+            per_token_policy_gradient_loss=per_token_loss,
+            mask=tokenized["response_mask"].to(model_device),
+            loss_normalization=loss_normalization,
+            normalization_constant=normalization_constant
+        ) * (per_token_loss.shape[0] / batch_size)  # NOTE: Important!!! Remember to rescale the loss to make the accumulated loss equivalent to the full-batch loss
+        microbatch_loss.backward()
+        loss += microbatch_loss.detach()
 
-
-"""
-The below adapters are used in the optional 
-RLHF / safety part of the Alignment assignment.
-"""
-
-
-def get_packed_sft_dataset(
-    tokenizer: PreTrainedTokenizerBase,
-    dataset_path: str | os.PathLike,
-    seq_length: int,
-    shuffle: bool,
-) -> Dataset:
-    """
-    Given a tokenizer and a path to a dataset with instruction-tuning examples,
-    construct a PyTorch Dataset for language modeling. The examples should be
-    packed, i.e., all sequences in the dataset are of a constant length (`seq_length`).
-
-    Args:
-        tokenizer: transformers.PreTrainedTokenizerBase
-            Transformers tokenizer to use in tokenizing and encoding text.
-        dataset_path: str
-            Path to file with instruction-tuning examples.
-        seq_length: int
-            Number of tokens to include in each example.
-        shuffle: bool
-            If true, shuffle the documents before packing them into examples.
-
-    Returns:
-        PyTorch Dataset for language modeling. Each example in this dataset is a dictionary of
-        with keys "input_ids" and "labels" (both tensors of shape (seq_length, )).
-        "input_ids" contains the token IDs for the language modeling inputs, and "labels" contains
-        the token IDs for the language modeling labels.
-    """
-    raise NotImplementedError
-
-
-def run_iterate_batches(
-    dataset: Dataset,
-    batch_size: int,
-    shuffle: bool,
-):
-    """
-    Given a PyTorch Dataset, return an iterable over batches of size `batch_size`.
-    Iterating through the returned iterable should constitute one epoch over the Dataset.
-
-    Args:
-        dataset: Dataset
-            Dataset to emit batches from.
-        batch_size: int
-            Number of examples to include per batch.
-        shuffle: bool
-            If true, shuffle examples before batching them.
-
-    Returns:
-        Iterable over batches, where each batch has size `batch_size`.
-    """
-    raise NotImplementedError
-
-
-def run_parse_mmlu_response(
-    mmlu_example: dict[str, Any],
-    model_output: str,
-) -> str | None:
-    """
-    Given an MMLU example and a model output, parse the model output into a
-    predicted option letter (i.e., 'A', 'B', 'C', or 'D'). If the model output
-    cannot be parsed into a prediction option letter, return None.
-
-    mmlu_example: dict[str, Any]
-        Dictionary with an MMLU example. Contains the following keys:
-        - "subject": str with the subject of the question.
-        - "question": str with the text of the question.
-        - "options": list[str] with the four answer options (in order).
-                     The first option refers to letter "A", the second to "B", etc.
-        - "answer": str with the option of the correct answer (e.g., "A")
-    model_output: str
-        str with the model's output to the MMLU example.
-
-    Returns:
-        str (one of "A", "B", "C", or "D") if the model output can be parsed into a prediction,
-        else None.
-    """
-    raise NotImplementedError
-
-
-def run_parse_gsm8k_response(
-    model_output: str,
-) -> str | None:
-    """
-    Given a GSM8K model output, parse the model output into a predicted numeric answer by
-    taking the last number that occurs in the output.
-
-    model_output: str
-        str with the model's output to a GSM8K example.
-
-    Returns:
-        str with the predicted numeric answer if the model output can be parsed into a prediction,
-        else None.
-    """
-    raise NotImplementedError
-
-
-def run_compute_per_instance_dpo_loss(
-    lm: torch.nn.Module,
-    lm_ref: torch.nn.Module,
-    tokenizer: PreTrainedTokenizerBase,
-    beta: float,
-    prompt: str,
-    response_chosen: str,
-    response_rejected: str,
-) -> torch.Tensor:
-    """
-    Given two language models (`lm`, and the "reference model" `lm_ref`),
-    their tokenizer, the DPO beta hyperparameter, a prompt and a pair
-    of responses to the prompt, computes the value of the DPO loss for this example.
-
-    lm: torch.nn.Module
-        Language model being trained.
-    lm_ref: torch.nn.Module
-        Reference language model.
-    tokenizer: PreTrainedTokenizerBase
-        Tokenizer for both language models.
-    beta: float
-        DPO beta hyperparameter.
-    prompt: str
-        Prompt for this instance of preference pair.
-    response_chosen: str
-        Preferred response to the prompt.
-    response_rejected: str
-        Rejected response to the prompt.
-
-    Returns:
-        torch.Tensor with the DPO loss for this example.
-    """
-    raise NotImplementedError
+    total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+    optimizer.step()
+    optimizer.zero_grad()
+    metadata={
+        "gradient_norm": total_norm,
+        "token_entropy": avg_entropy,
+        "mean_total_reward": raw_rewards_metadata["mean_total_reward"],
+        "mean_format_reward": raw_rewards_metadata["mean_format_reward"],
+    }
+    return loss, metadata
