@@ -16,11 +16,13 @@ def _get_attn_implementation(device: str) -> str:
 
 
 def get_model_and_tokenizer(model_id_or_dir: str, device: str):
+    attn_implementation = _get_attn_implementation(device)
+    print(f"Loading the model with attn_implementation={attn_implementation}...")
     model = AutoModelForCausalLM.from_pretrained(
         model_id_or_dir,
         device_map=device,
         torch_dtype=torch.bfloat16,
-        attn_implementation=_get_attn_implementation(device),
+        attn_implementation=attn_implementation,
     )
     tokenizer = AutoTokenizer.from_pretrained(model_id_or_dir)
     return model, tokenizer
