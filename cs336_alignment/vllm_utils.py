@@ -1,5 +1,5 @@
 """
-Small vLLM helpers for server lifecycle, completion requests, and NCCL weight sync.
+Small vLLM helpers for server lifecycle, completion requests, and weight sync.
 """
 
 import atexit
@@ -12,6 +12,7 @@ import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from typing import Literal
 
 import torch
 
@@ -35,6 +36,7 @@ class VLLMServer:
     load_format: str = "auto"
     logging_level: str = "ERROR"
     gpu_memory_utilization: float = 0.9
+    weight_transfer_backend: Literal["nccl", "ipc"] = "nccl"
     launch_server: bool = True
     startup_timeout: int = 600
     shutdown_timeout: int = 30
@@ -56,6 +58,7 @@ class VLLMServer:
                 load_format=self.load_format,
                 logging_level=self.logging_level,
                 gpu_memory_utilization=self.gpu_memory_utilization,
+                weight_transfer_backend=self.weight_transfer_backend,
             )
             atexit.register(self.stop)
         wait_for_server(self.base_url, self.process, self.startup_timeout)
@@ -64,10 +67,16 @@ class VLLMServer:
         stop_server(self.process, timeout=self.shutdown_timeout)
 
     def init_weight_sync(self, policy_device: str):
+        if self.weight_transfer_backend == "ipc":
+            self.weight_sync_group = None
+            return None
         self.weight_sync_group = init_weight_sync(self.base_url, policy_device)
         return self.weight_sync_group
 
     def sync_policy_weights(self, policy: torch.nn.Module) -> None:
+        if self.weight_transfer_backend == "ipc":
+            sync_policy_weights_ipc(policy, self.base_url)
+            return
         if self.weight_sync_group is None:
             raise RuntimeError("Call init_weight_sync before sync_policy_weights.")
         sync_policy_weights(policy, self.base_url, self.weight_sync_group)
@@ -122,11 +131,14 @@ def start_server(
     load_format: str,
     logging_level: str,
     gpu_memory_utilization: float = 0.9,
+    weight_transfer_backend: Literal["nccl", "ipc"] = "nccl",
 ) -> subprocess.Popen:
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = str(gpu)
     env["VLLM_SERVER_DEV_MODE"] = "1"
     env["VLLM_LOGGING_LEVEL"] = logging_level
+    if weight_transfer_backend == "ipc":
+        env["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
     command = [
         "vllm",
         "serve",
@@ -145,7 +157,7 @@ def start_server(
         "--tensor-parallel-size",
         "1",
         "--weight-transfer-config",
-        json.dumps({"backend": "nccl"}),
+        json.dumps({"backend": weight_transfer_backend}),
         "--load-format",
         load_format,
     ]
@@ -290,3 +302,22 @@ def sync_policy_weights(policy: torch.nn.Module, vllm_base_url: str, weight_sync
         update_future.result()
     _http_json("POST", f"{vllm_base_url}/reset_prefix_cache", timeout=60)
     _http_json("POST", f"{vllm_base_url}/resume", timeout=60)
+
+
+def sync_policy_weights_ipc(policy: torch.nn.Module, vllm_base_url: str) -> None:
+    """Copy policy weights into a same-GPU vLLM worker via CUDA IPC handles."""
+    from vllm.distributed.weight_transfer.ipc_engine import (
+        IPCTrainerSendWeightsArgs,
+        IPCWeightTransferEngine,
+    )
+
+    torch.cuda.set_device(next(policy.parameters()).device)
+    _http_json("POST", f"{vllm_base_url}/pause", timeout=60)
+    try:
+        IPCWeightTransferEngine.trainer_send_weights(
+            iterator=iter(policy.named_parameters()),
+            trainer_args=IPCTrainerSendWeightsArgs(mode="http", url=vllm_base_url),
+        )
+        _http_json("POST", f"{vllm_base_url}/reset_prefix_cache", timeout=60)
+    finally:
+        _http_json("POST", f"{vllm_base_url}/resume", timeout=60)

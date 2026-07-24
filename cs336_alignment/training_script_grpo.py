@@ -1,9 +1,11 @@
 wandb_project_name = "OLMo-2-0425-1B_GRPO_GSM8K"
-wandb_exp_name = "r1-zero-prompt_default-hparams_max-tokens-256"
+wandb_exp_name = "r1-zero-prompt_default-hparams_max-tokens-256_dgx-spark"
 
 model_id = "allenai/OLMo-2-0425-1B"
-policy_device = 2
-rollout_device = 3
+policy_device = 0
+rollout_device = 0
+gpu_memory_utilization = 0.5
+weight_transfer_backend = "ipc" if policy_device == rollout_device else "nccl"
 prompt_path = "prompts/r1_zero.prompt"
 
 n_train_examples = 6400
@@ -82,7 +84,13 @@ optimizer = torch.optim.AdamW(
 # B: rollout model
 from vllm_utils import VLLMServer
 
-llm_rollout = VLLMServer(model_id=model_id, gpu=rollout_device, seed=seed)
+llm_rollout = VLLMServer(
+    model_id=model_id,
+    gpu=rollout_device,
+    seed=seed,
+    gpu_memory_utilization=gpu_memory_utilization,
+    weight_transfer_backend=weight_transfer_backend,
+)
 print(f"Starting the rollout model (vLLM service)...")
 llm_rollout.start()
 llm_rollout.init_weight_sync(policy_device=llm_policy_device)  # NOTE: Create the communication channel between two llms
