@@ -1,53 +1,129 @@
-wandb_project_name = "OLMo-2-0425-1B_GRPO_GSM8K"
-wandb_exp_name = "r1-zero-prompt_default-hparams_max-tokens-256_lora-r-16-a-32-dropout-0-fp32"
+import argparse
 
-model_id = "allenai/OLMo-2-0425-1B"
-policy_device = 2
-rollout_device = 3
-gpu_memory_utilization = 0.9
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train OLMo with GRPO on GSM8K.")
+
+    parser.add_argument("--wandb-project-name", default="OLMo-2-0425-1B_GRPO_GSM8K")
+    parser.add_argument(
+        "--wandb-exp-name",
+        default="r1-zero-prompt_default-hparams_max-tokens-256_lora-r-16-a-32-dropout-0-fp32",
+    )
+    parser.add_argument("--model-id", default="allenai/OLMo-2-0425-1B")
+    parser.add_argument("--policy-device", type=int, default=2)
+    parser.add_argument("--rollout-device", type=int, default=3)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
+    parser.add_argument("--prompt-path", default="prompts/r1_zero.prompt")
+
+    parser.add_argument("--n-train-examples", type=int, default=6400)
+    parser.add_argument("--n-val-examples", type=int, default=1024)
+    parser.add_argument("--num-rollout-steps", type=int, default=200)
+    parser.add_argument("--learning-rate", type=float, default=1e-5)
+    parser.add_argument("--rollout-batch-size", type=int, default=256)
+    parser.add_argument("--train-batch-size", type=int, default=256)
+    parser.add_argument("--group-size", type=int, default=8)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=32)
+    parser.add_argument("--sampling-temperature", type=float, default=1.0)
+    parser.add_argument("--sampling-max-tokens", type=int, default=256)
+    parser.add_argument("--sampling-stop", default="</answer>")
+    parser.add_argument(
+        "--include-stop-str-in-output",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--max-grad-norm", type=float, default=1.0)
+    parser.add_argument(
+        "--adamw-betas",
+        type=float,
+        nargs=2,
+        metavar=("BETA1", "BETA2"),
+        default=(0.9, 0.95),
+    )
+    parser.add_argument("--weight-decay", type=float, default=0.0)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--track-policy-memory",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+
+    parser.add_argument(
+        "--use-peft",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--peft-method", choices=("lora",), default="lora")
+    parser.add_argument("--lora-r", type=int, default=16)
+    parser.add_argument("--lora-alpha", type=int, default=32)
+    parser.add_argument("--lora-dropout", type=float, default=0.0)
+    parser.add_argument("--lora-adapter-name", default="policy")
+    parser.add_argument(
+        "--lora-target-modules",
+        nargs="+",
+        default=[
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ],
+    )
+    parser.add_argument(
+        "--autocast-adapter-dtype",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use fp32 LoRA weights; pass --no-autocast-adapter-dtype for bf16.",
+    )
+    return parser.parse_args()
+
+
+args = parse_args()
+wandb_project_name = args.wandb_project_name
+wandb_exp_name = args.wandb_exp_name
+model_id = args.model_id
+policy_device = args.policy_device
+rollout_device = args.rollout_device
+gpu_memory_utilization = args.gpu_memory_utilization
 weight_transfer_backend = "ipc" if policy_device == rollout_device else "nccl"
-prompt_path = "prompts/r1_zero.prompt"
-
-n_train_examples = 6400
-n_val_examples = 1024
-num_rollout_steps = 200
-learning_rate = 1e-5
-rollout_batch_size = train_batch_size = 256
-group_size = 8
-gradient_accumulation_steps = 32
-sampling_temperature = 1.0
-sampling_max_tokens = 256
-max_grad_norm = 1.0
-adamw_betas = (0.9, 0.95)
-weight_decay = 0.0
-seed = 42
-track_policy_memory = True
+prompt_path = args.prompt_path
+n_train_examples = args.n_train_examples
+n_val_examples = args.n_val_examples
+num_rollout_steps = args.num_rollout_steps
+learning_rate = args.learning_rate
+rollout_batch_size = args.rollout_batch_size
+train_batch_size = args.train_batch_size
+group_size = args.group_size
+gradient_accumulation_steps = args.gradient_accumulation_steps
+sampling_temperature = args.sampling_temperature
+sampling_max_tokens = args.sampling_max_tokens
+max_grad_norm = args.max_grad_norm
+adamw_betas = tuple(args.adamw_betas)
+weight_decay = args.weight_decay
+seed = args.seed
+track_policy_memory = args.track_policy_memory
+use_peft = args.use_peft
+peft_method = args.peft_method
+lora_r = args.lora_r
+lora_alpha = args.lora_alpha
+lora_dropout = args.lora_dropout
+lora_adapter_name = args.lora_adapter_name
+lora_target_modules = args.lora_target_modules
+autocast_adapter_dtype = args.autocast_adapter_dtype
 
 sampling_params = {
     "temperature": sampling_temperature,
     "max_tokens": sampling_max_tokens,
     "n": group_size,
     "seed": seed,
-    "stop": "</answer>",
-    "include_stop_str_in_output": True
+    "stop": args.sampling_stop,
+    "include_stop_str_in_output": args.include_stop_str_in_output,
 }
-
-use_peft = True
-peft_method = "lora"
-lora_r = 16
-lora_alpha = 32
-lora_dropout = 0.00
-lora_adapter_name = "policy"
-lora_target_modules = [
-    "q_proj", "k_proj", "v_proj", "o_proj",
-    "gate_proj", "up_proj", "down_proj",
-]
-autocast_adapter_dtype=True  # NOTE: False: bf16, True: fp32
 
 import os
 from dotenv import load_dotenv
 load_dotenv()
-print(f"HF_HOME: {os.getenv("HF_HOME")}")
+print(f"HF_HOME: {os.getenv('HF_HOME')}")
 
 import wandb
 wandb.login()
