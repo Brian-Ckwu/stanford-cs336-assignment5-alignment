@@ -21,6 +21,7 @@ max_grad_norm = 1.0
 adamw_betas = (0.9, 0.95)
 weight_decay = 0.0
 seed = 42
+track_policy_memory = True
 
 sampling_params = {
     "temperature": sampling_temperature,
@@ -96,7 +97,7 @@ llm_rollout.start()
 llm_rollout.init_weight_sync(policy_device=llm_policy_device)  # NOTE: Create the communication channel between two llms
 
 # Training loop
-from grpo_core_implementation import grpo_train_step
+from grpo_core_implementation import grpo_train_step, track_cuda_memory
 from drgrpo_grader import r1_zero_reward_fn
 
 # NOTE: currently just train for one epoch to avoid overfitting, so I add the following check
@@ -145,15 +146,26 @@ for i in tqdm(range(num_rollout_steps), desc="GRPO training steps"):
         rollout_responses=responses,
         repeated_ground_truths=answers,
         group_size=group_size,
+        track_policy_memory=track_policy_memory,
     )
-    wandb_run.log(data={
-        "train/loss": train_step_loss,
-        **{f"train/{key}": value for key, value in train_step_metadata.items()}
-    }, step=i)
     # Sync weights
     print("Syncing weights of the rollout LLM to be the same with the updated policy LLM...")
-    llm_rollout.sync_policy_weights(policy=llm_policy)
+    sync_memory_metrics = {}
+    with track_cuda_memory(
+        "weight_sync",
+        next(llm_policy.parameters()).device,
+        sync_memory_metrics,
+        track_policy_memory,
+    ):
+        llm_rollout.sync_policy_weights(policy=llm_policy)
+    memory_metrics = train_step_metadata.pop("memory_metrics")
+    memory_metrics.update(sync_memory_metrics)
     print("Syncing done!")
+    wandb_run.log(data={
+        "train/loss": train_step_loss,
+        **{f"train/{key}": value for key, value in train_step_metadata.items()},
+        **memory_metrics
+    }, step=i)
     # TODO: validation
 
 # Closing

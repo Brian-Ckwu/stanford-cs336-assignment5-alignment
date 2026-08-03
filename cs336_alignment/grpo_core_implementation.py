@@ -1,8 +1,54 @@
-from typing import Callable, Literal
+from contextlib import contextmanager
+from typing import Callable, Iterator, Literal
 
 import torch
 from torch import Tensor
 from transformers import PreTrainedTokenizerBase
+
+
+@contextmanager
+def track_cuda_memory(
+    name: str,
+    device: torch.device,
+    metrics: dict[str, float],
+    enabled: bool = True,
+) -> Iterator[None]:
+    """Record peak and persistent CUDA memory changes for one operation.
+
+    Repeated measurements with the same name are reduced by taking the maximum,
+    which makes this suitable for aggregating measurements across microbatches.
+    """
+    if not enabled or device.type != "cuda":
+        yield
+        return
+
+    gib = 2**30
+    torch.cuda.synchronize(device)
+    before_allocated = torch.cuda.memory_allocated(device)
+    before_reserved = torch.cuda.memory_reserved(device)
+    torch.cuda.reset_peak_memory_stats(device)
+
+    try:
+        yield
+    finally:
+        torch.cuda.synchronize(device)
+        measurements = {
+            "peak_allocated_gib": torch.cuda.max_memory_allocated(device) / gib,
+            "peak_reserved_gib": torch.cuda.max_memory_reserved(device) / gib,
+            "peak_extra_gib": (
+                torch.cuda.max_memory_allocated(device) - before_allocated
+            ) / gib,
+            "end_allocated_delta_gib": (
+                torch.cuda.memory_allocated(device) - before_allocated
+            ) / gib,
+            "end_reserved_delta_gib": (
+                torch.cuda.memory_reserved(device) - before_reserved
+            ) / gib,
+        }
+        for metric_name, value in measurements.items():
+            key = f"policy_memory/{name}/{metric_name}"
+            metrics[key] = max(metrics.get(key, float("-inf")), value)
+
 
 def tokenize_prompt_and_output(
     prompt_strs: list[str],
@@ -344,6 +390,7 @@ def grpo_train_step(
     cliprange: float | None = None,
     loss_normalization: Literal["sequence", "constant"] = "sequence",
     normalization_constant: int | None = None,
+    track_policy_memory: bool = False,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor | float]]:
     """Execute forward-and-backward passes, with gradient_accumulation_steps
     microbatches.
@@ -417,6 +464,8 @@ def grpo_train_step(
     assert len(repeated_prompts) == len(rollout_responses) == len(repeated_ground_truths)
     batch_size = len(repeated_prompts)
     microbatch_size = batch_size // gradient_accumulation_steps  # NOTE: it's okay if batch_size / gradient_accumulation_steps is not an integer (see the note below)
+    model_device = next(model.parameters()).device  # This assumes all model parameters are on the same GPU.
+    memory_metrics: dict[str, float] = {}
     # Gradient accumulation across microbatches
     loss = torch.tensor(0.0)
     avg_entropy = torch.tensor(0.0)  # TODO: check why this information might be useful and whether my implementation is reasonable
@@ -428,40 +477,63 @@ def grpo_train_step(
         microbatch_old_log_probs = old_log_probs[i*microbatch_size:(i+1)*microbatch_size] if old_log_probs else None
         # Tokenization (on CPU)
         tokenized = tokenize_prompt_and_output(prompts, responses, tokenizer)  # a dict with keys "input_ids", "labels", and "response_mask"
+        if track_policy_memory:
+            memory_metrics["policy_memory/max_sequence_length"] = max(
+                memory_metrics.get("policy_memory/max_sequence_length", 0),
+                float(tokenized["input_ids"].shape[1]),
+            )
         # Get each prefix-conditioned response token's logprob (and optionally entropy), which is necessary for computing policy gradients
-        model_device = next(model.parameters()).device  # NOTE: this assume that all parameters of the model are on the same GPU
-        response_token_logprobs = get_response_log_probs(  # two keys: ["log_probs", "token_entropy"], shape of the logprobs: (microbatch_size, max_sequence_length_in_this_microbatch)
-            model,
-            input_ids=tokenized["input_ids"].to(model_device),
-            labels=tokenized["labels"].to(model_device),  # Remember to move the tokenized data to the same device as the model
-            return_token_entropy=True
-        )
+        with track_cuda_memory(
+            "forward_logprobs", model_device, memory_metrics, track_policy_memory
+        ):
+            response_token_logprobs = get_response_log_probs(  # two keys: ["log_probs", "token_entropy"], shape of the logprobs: (microbatch_size, max_sequence_length_in_this_microbatch)
+                model,
+                input_ids=tokenized["input_ids"].to(model_device),
+                labels=tokenized["labels"].to(model_device),  # Remember to move the tokenized data to the same device as the model
+                return_token_entropy=True
+            )
         avg_entropy += response_token_logprobs["token_entropy"].mean().detach().cpu() * (len(prompts) / batch_size)
         # Compute policy-gradient loss
-        per_token_loss, per_token_loss_metadata = compute_policy_gradient_loss(
-            raw_rewards_or_advantages=microbatch_advantages.to(model_device),  # NOTE: remember to move to the same device!
-            policy_log_probs=response_token_logprobs["log_probs"],
-            importance_reweighting_method=importance_reweighting_method,
-            old_log_probs=microbatch_old_log_probs.to(model_device) if microbatch_old_log_probs else None,
-            cliprange=cliprange,
-            response_mask=tokenized["response_mask"].to(model_device)
-        )
-        microbatch_loss = aggregate_loss_across_microbatch(
-            per_token_policy_gradient_loss=per_token_loss,
-            mask=tokenized["response_mask"].to(model_device),
-            loss_normalization=loss_normalization,
-            normalization_constant=normalization_constant
-        ) * (per_token_loss.shape[0] / batch_size)  # NOTE: Important!!! Remember to rescale the loss to make the accumulated loss equivalent to the full-batch loss
-        microbatch_loss.backward()
+        with track_cuda_memory(
+            "loss", model_device, memory_metrics, track_policy_memory
+        ):
+            per_token_loss, per_token_loss_metadata = compute_policy_gradient_loss(
+                raw_rewards_or_advantages=microbatch_advantages.to(model_device),  # NOTE: remember to move to the same device!
+                policy_log_probs=response_token_logprobs["log_probs"],
+                importance_reweighting_method=importance_reweighting_method,
+                old_log_probs=microbatch_old_log_probs.to(model_device) if microbatch_old_log_probs else None,
+                cliprange=cliprange,
+                response_mask=tokenized["response_mask"].to(model_device)
+            )
+            microbatch_loss = aggregate_loss_across_microbatch(
+                per_token_policy_gradient_loss=per_token_loss,
+                mask=tokenized["response_mask"].to(model_device),
+                loss_normalization=loss_normalization,
+                normalization_constant=normalization_constant
+            ) * (per_token_loss.shape[0] / batch_size)  # NOTE: Important!!! Remember to rescale the loss to make the accumulated loss equivalent to the full-batch loss
+        with track_cuda_memory(
+            "backward", model_device, memory_metrics, track_policy_memory
+        ):
+            microbatch_loss.backward()
         loss += microbatch_loss.detach().cpu()
 
-    total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
-    optimizer.step()
-    optimizer.zero_grad()
+    with track_cuda_memory(
+        "grad_clip", model_device, memory_metrics, track_policy_memory
+    ):
+        total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+    with track_cuda_memory(
+        "optimizer_step", model_device, memory_metrics, track_policy_memory
+    ):
+        optimizer.step()
+    with track_cuda_memory(
+        "zero_grad", model_device, memory_metrics, track_policy_memory
+    ):
+        optimizer.zero_grad(set_to_none=True)
     metadata={
         "gradient_norm": total_norm,
         "token_entropy": avg_entropy,
         "mean_total_reward": raw_rewards_metadata["mean_total_reward"],
         "mean_format_reward": raw_rewards_metadata["mean_format_reward"],
+        "memory_metrics": memory_metrics,
     }
     return loss, metadata
