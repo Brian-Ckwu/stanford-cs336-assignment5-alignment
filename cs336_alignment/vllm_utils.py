@@ -37,6 +37,9 @@ class VLLMServer:
     logging_level: str = "ERROR"
     gpu_memory_utilization: float = 0.9
     weight_transfer_backend: Literal["nccl", "ipc"] = "nccl"
+    enable_lora: bool = False
+    max_lora_rank: int = 16
+    max_loras: int = 1
     launch_server: bool = True
     startup_timeout: int = 600
     shutdown_timeout: int = 30
@@ -45,6 +48,7 @@ class VLLMServer:
         self.base_url = f"http://{self.host}:{self.port}"
         self.process = None
         self.weight_sync_group = None
+        self.served_model_id = self.model_id
 
     def start(self) -> None:
         if self.launch_server:
@@ -59,6 +63,9 @@ class VLLMServer:
                 logging_level=self.logging_level,
                 gpu_memory_utilization=self.gpu_memory_utilization,
                 weight_transfer_backend=self.weight_transfer_backend,
+                enable_lora=self.enable_lora,
+                max_lora_rank=self.max_lora_rank,
+                max_loras=self.max_loras,
             )
             atexit.register(self.stop)
         wait_for_server(self.base_url, self.process, self.startup_timeout)
@@ -81,6 +88,29 @@ class VLLMServer:
             raise RuntimeError("Call init_weight_sync before sync_policy_weights.")
         sync_policy_weights(policy, self.base_url, self.weight_sync_group)
 
+    def load_lora_adapter(
+        self,
+        name: str,
+        path: str,
+        *,
+        load_inplace: bool = False,
+    ) -> None:
+        if not self.enable_lora:
+            raise RuntimeError("Start the vLLM server with enable_lora=True.")
+        _http_json(
+            "POST",
+            f"{self.base_url}/v1/load_lora_adapter",
+            {
+                "lora_name": name,
+                "lora_path": os.path.abspath(path),
+                "load_inplace": load_inplace,
+            },
+            timeout=300,
+        )
+        # Prefix-cache entries produced by older adapter weights are stale.
+        _http_json("POST", f"{self.base_url}/reset_prefix_cache", timeout=60)
+        self.served_model_id = name
+
     def generate_completions(
         self,
         prompts: list[str],
@@ -89,7 +119,7 @@ class VLLMServer:
     ) -> list[VLLMCompletion]:
         return generate_completions(
             vllm_base_url=self.base_url,
-            model_id=self.model_id,
+            model_id=self.served_model_id,
             prompts=prompts,
             sampling_params=sampling_params,
             batch_size=batch_size,
@@ -108,7 +138,13 @@ def _http_json(method: str, url: str, payload: dict | None = None, timeout: int 
         body = response.read()
     if not body:
         return {}
-    return json.loads(body)
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError:
+        # Some successful vLLM endpoints, including LoRA loading, return
+        # plain-text confirmation rather than JSON.
+        return {"message": body.decode("utf-8", errors="replace")}
+    return parsed if isinstance(parsed, dict) else {"result": parsed}
 
 
 def kill_existing_vllm_server(port: int) -> None:
@@ -132,6 +168,9 @@ def start_server(
     logging_level: str,
     gpu_memory_utilization: float = 0.9,
     weight_transfer_backend: Literal["nccl", "ipc"] = "nccl",
+    enable_lora: bool = False,
+    max_lora_rank: int = 16,
+    max_loras: int = 1,
 ) -> subprocess.Popen:
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = str(gpu)
@@ -139,6 +178,8 @@ def start_server(
     env["VLLM_LOGGING_LEVEL"] = logging_level
     if weight_transfer_backend == "ipc":
         env["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
+    if enable_lora:
+        env["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "True"
     command = [
         "vllm",
         "serve",
@@ -161,6 +202,16 @@ def start_server(
         "--load-format",
         load_format,
     ]
+    if enable_lora:
+        command.extend(
+            [
+                "--enable-lora",
+                "--max-lora-rank",
+                str(max_lora_rank),
+                "--max-loras",
+                str(max_loras),
+            ]
+        )
     logger.info("Starting vLLM server: %s", " ".join(command))
     return subprocess.Popen(command, env=env, start_new_session=True)
 

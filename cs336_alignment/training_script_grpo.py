@@ -1,10 +1,10 @@
 wandb_project_name = "OLMo-2-0425-1B_GRPO_GSM8K"
-wandb_exp_name = "r1-zero-prompt_default-hparams_max-tokens-256_dgx-spark"
+wandb_exp_name = "r1-zero-prompt_default-hparams_max-tokens-256_lora-r-16-a-32-dropout-0-fp32"
 
 model_id = "allenai/OLMo-2-0425-1B"
-policy_device = 0
-rollout_device = 0
-gpu_memory_utilization = 0.5
+policy_device = 2
+rollout_device = 3
+gpu_memory_utilization = 0.9
 weight_transfer_backend = "ipc" if policy_device == rollout_device else "nccl"
 prompt_path = "prompts/r1_zero.prompt"
 
@@ -31,6 +31,18 @@ sampling_params = {
     "stop": "</answer>",
     "include_stop_str_in_output": True
 }
+
+use_peft = True
+peft_method = "lora"
+lora_r = 16
+lora_alpha = 32
+lora_dropout = 0.00
+lora_adapter_name = "policy"
+lora_target_modules = [
+    "q_proj", "k_proj", "v_proj", "o_proj",
+    "gate_proj", "up_proj", "down_proj",
+]
+autocast_adapter_dtype=True  # NOTE: False: bf16, True: fp32
 
 import os
 from dotenv import load_dotenv
@@ -78,8 +90,31 @@ from checkpoint import get_model_and_tokenizer
 
 llm_policy_device = f"cuda:{policy_device}"
 llm_policy, tokenizer = get_model_and_tokenizer(model_id, device=llm_policy_device)
+
+from peft import LoraConfig, TaskType, get_peft_model
+if use_peft:
+    peft_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        r=lora_r,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+        target_modules=lora_target_modules,
+        bias="none",
+    )
+    llm_policy = get_peft_model(llm_policy, peft_config, autocast_adapter_dtype=autocast_adapter_dtype)
+    llm_policy.print_trainable_parameters()
+    lora_dtype = {
+        parameter.dtype
+        for name, parameter in llm_policy.named_parameters()
+        if "lora_" in name
+    }
+    print(f"LoRA dtype: {lora_dtype}")
+
 optimizer = torch.optim.AdamW(
-    llm_policy.parameters(), lr=learning_rate, betas=adamw_betas, weight_decay=weight_decay
+    (p for p in llm_policy.parameters() if p.requires_grad),
+    lr=learning_rate,
+    betas=adamw_betas,
+    weight_decay=weight_decay
 )
 
 # B: rollout model
@@ -91,10 +126,24 @@ llm_rollout = VLLMServer(
     seed=seed,
     gpu_memory_utilization=gpu_memory_utilization,
     weight_transfer_backend=weight_transfer_backend,
+    enable_lora=use_peft,
+    max_lora_rank=lora_r,
+    max_loras=1,
 )
 print(f"Starting the rollout model (vLLM service)...")
 llm_rollout.start()
-llm_rollout.init_weight_sync(policy_device=llm_policy_device)  # NOTE: Create the communication channel between two llms
+runtime_adapter_dir = None
+if use_peft:
+    import tempfile
+
+    runtime_adapter_dir = tempfile.TemporaryDirectory(prefix="grpo_lora_")
+    llm_policy.save_pretrained(runtime_adapter_dir.name, safe_serialization=True)
+    llm_rollout.load_lora_adapter(
+        lora_adapter_name,
+        runtime_adapter_dir.name,
+    )
+else:
+    llm_rollout.init_weight_sync(policy_device=llm_policy_device)  # NOTE: Create the communication channel between two llms
 
 # Training loop
 from grpo_core_implementation import grpo_train_step, track_cuda_memory
@@ -157,7 +206,18 @@ for i in tqdm(range(num_rollout_steps), desc="GRPO training steps"):
         sync_memory_metrics,
         track_policy_memory,
     ):
-        llm_rollout.sync_policy_weights(policy=llm_policy)
+        if use_peft:
+            llm_policy.save_pretrained(
+                runtime_adapter_dir.name,
+                safe_serialization=True,
+            )
+            llm_rollout.load_lora_adapter(
+                lora_adapter_name,
+                runtime_adapter_dir.name,
+                load_inplace=True,
+            )
+        else:
+            llm_rollout.sync_policy_weights(policy=llm_policy)
     memory_metrics = train_step_metadata.pop("memory_metrics")
     memory_metrics.update(sync_memory_metrics)
     print("Syncing done!")
@@ -170,9 +230,15 @@ for i in tqdm(range(num_rollout_steps), desc="GRPO training steps"):
 
 # Closing
 llm_rollout.stop()
+if runtime_adapter_dir is not None:
+    runtime_adapter_dir.cleanup()
 
 output_dir = f"checkpoints/{wandb_exp_name}-final"
-llm_policy.save_pretrained(output_dir, safe_serialization=True)
 tokenizer.save_pretrained(output_dir)
+if use_peft:  # NOTE: currently save the full merged model instead of the adapter only
+    merged = llm_policy.merge_and_unload()  # XXX: understand this
+    merged.save_pretrained(output_dir, safe_serialization=True)
+else:
+    llm_policy.save_pretrained(output_dir, safe_serialization=True)
 
 wandb_run.finish()
