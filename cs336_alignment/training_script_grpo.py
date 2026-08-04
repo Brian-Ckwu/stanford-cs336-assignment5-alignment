@@ -45,6 +45,11 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
     )
+    parser.add_argument(
+        "--track-step-time",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
 
     parser.add_argument(
         "--use-peft",
@@ -102,6 +107,7 @@ adamw_betas = tuple(args.adamw_betas)
 weight_decay = args.weight_decay
 seed = args.seed
 track_policy_memory = args.track_policy_memory
+track_step_time = args.track_step_time
 use_peft = args.use_peft
 peft_method = args.peft_method
 lora_r = args.lora_r
@@ -222,7 +228,7 @@ else:
     llm_rollout.init_weight_sync(policy_device=llm_policy_device)  # NOTE: Create the communication channel between two llms
 
 # Training loop
-from grpo_core_implementation import grpo_train_step, track_cuda_memory
+from grpo_core_implementation import grpo_train_step, track_cuda_memory_and_time
 from drgrpo_grader import r1_zero_reward_fn
 
 # NOTE: currently just train for one epoch to avoid overfitting, so I add the following check
@@ -234,6 +240,7 @@ print(f"Rollout batch size: {rollout_batch_size}; # Questions per rollout: {n_qu
 from tqdm import tqdm
 
 for i in tqdm(range(num_rollout_steps), desc="GRPO training steps"):
+    time_metrics = {}
     train_rows = train_dataset[i*n_questions_per_rollout:(i+1)*n_questions_per_rollout]
     print(f"Generating rollouts for the following {len(train_rows)} questions (answers): ", [train_row["question"].split()[0] + f" ({train_row['answer']})" for train_row in train_rows])
     # Curate repeated prompts for generating rollouts
@@ -245,14 +252,20 @@ for i in tqdm(range(num_rollout_steps), desc="GRPO training steps"):
     assert len(prompts) == len(answers) == rollout_batch_size
     # Generate rollouts
     print(f"Generating {len(prompts)} rollouts with vLLM...")
-    completions = llm_rollout.generate_completions(
-        prompts=vllm_prompts,
-        sampling_params=sampling_params,  # NOTE: "n": group_size --> so I use vllm_prompts instead of prompts
-        batch_size=rollout_batch_size
-    )
-    responses = [completion.text for completion in completions]
-    print(f"Successfully generated {len(responses)} rollouts for {len(prompts)} prompts!")
-    assert len(prompts) == len(responses)
+    with track_cuda_memory_and_time(
+        "rollout_full_batch",
+        time_metrics=time_metrics,
+        track_memory=False,
+        track_time=track_step_time,
+    ):
+        completions = llm_rollout.generate_completions(
+            prompts=vllm_prompts,
+            sampling_params=sampling_params,  # NOTE: "n": group_size --> so I use vllm_prompts instead of prompts
+            batch_size=rollout_batch_size
+        )
+        responses = [completion.text for completion in completions]
+        print(f"Successfully generated {len(responses)} rollouts for {len(prompts)} prompts!")
+        assert len(prompts) == len(responses)
     # Print out sampled generations every 10 steps
     if i % 10 == 0:
         print(f"Prompt: {prompts[0]}")
@@ -260,27 +273,38 @@ for i in tqdm(range(num_rollout_steps), desc="GRPO training steps"):
             print(f"Response: {responses[index]}")
     # A single train step
     llm_policy.train()
-    train_step_loss, train_step_metadata = grpo_train_step(
-        model=llm_policy,
-        tokenizer=tokenizer,
-        optimizer=optimizer,
-        gradient_accumulation_steps=gradient_accumulation_steps,
-        max_grad_norm=max_grad_norm,
-        reward_fn=r1_zero_reward_fn,
-        repeated_prompts=prompts,
-        rollout_responses=responses,
-        repeated_ground_truths=answers,
-        group_size=group_size,
-        track_policy_memory=track_policy_memory,
-    )
+    with track_cuda_memory_and_time(
+        "policy_full_batch",
+        device=next(llm_policy.parameters()).device,
+        time_metrics=time_metrics,
+        track_memory=False,
+        track_time=track_step_time,
+    ):
+        train_step_loss, train_step_metadata = grpo_train_step(
+            model=llm_policy,
+            tokenizer=tokenizer,
+            optimizer=optimizer,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            max_grad_norm=max_grad_norm,
+            reward_fn=r1_zero_reward_fn,
+            repeated_prompts=prompts,
+            rollout_responses=responses,
+            repeated_ground_truths=answers,
+            group_size=group_size,
+            track_policy_memory=track_policy_memory,
+            track_step_time=track_step_time,
+        )
     # Sync weights
     print("Syncing weights of the rollout LLM to be the same with the updated policy LLM...")
     sync_memory_metrics = {}
-    with track_cuda_memory(
+    with track_cuda_memory_and_time(
         "weight_sync",
-        next(llm_policy.parameters()).device,
-        sync_memory_metrics,
-        track_policy_memory,
+        device=next(llm_policy.parameters()).device,
+        memory_metrics=sync_memory_metrics,
+        time_metrics=time_metrics,
+        time_name="policy_rollout_weight_sync",
+        track_memory=track_policy_memory,
+        track_time=track_step_time,
     ):
         if use_peft:
             llm_policy.save_pretrained(
@@ -296,11 +320,13 @@ for i in tqdm(range(num_rollout_steps), desc="GRPO training steps"):
             llm_rollout.sync_policy_weights(policy=llm_policy)
     memory_metrics = train_step_metadata.pop("memory_metrics")
     memory_metrics.update(sync_memory_metrics)
+    time_metrics.update(train_step_metadata.pop("time_metrics"))
     print("Syncing done!")
     wandb_run.log(data={
         "train/loss": train_step_loss,
         **{f"train/{key}": value for key, value in train_step_metadata.items()},
-        **memory_metrics
+        **memory_metrics,
+        **time_metrics,
     }, step=i)
     # TODO: validation
 

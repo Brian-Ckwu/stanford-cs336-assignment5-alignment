@@ -1,4 +1,5 @@
 from contextlib import contextmanager
+import time
 from typing import Callable, Iterator, Literal
 
 import torch
@@ -7,47 +8,75 @@ from transformers import PreTrainedTokenizerBase
 
 
 @contextmanager
-def track_cuda_memory(
+def track_cuda_memory_and_time(
     name: str,
-    device: torch.device,
-    metrics: dict[str, float],
-    enabled: bool = True,
+    *,
+    device: torch.device | None = None,
+    memory_metrics: dict[str, float] | None = None,
+    time_metrics: dict[str, float] | None = None,
+    time_name: str | None = None,
+    track_memory: bool = True,
+    track_time: bool = True,
 ) -> Iterator[None]:
-    """Record peak and persistent CUDA memory changes for one operation.
+    """Track synchronized CUDA memory and wall-clock time for one operation.
 
-    Repeated measurements with the same name are reduced by taking the maximum,
-    which makes this suitable for aggregating measurements across microbatches.
+    Repeated memory measurements use their maximum, while repeated time
+    measurements are summed across calls.
     """
-    if not enabled or device.type != "cuda":
+    memory_enabled = (
+        track_memory
+        and memory_metrics is not None
+        and device is not None
+        and device.type == "cuda"
+    )
+    time_enabled = track_time and time_metrics is not None
+    if not memory_enabled and not time_enabled:
         yield
         return
 
-    gib = 2**30
-    torch.cuda.synchronize(device)
-    before_allocated = torch.cuda.memory_allocated(device)
-    before_reserved = torch.cuda.memory_reserved(device)
-    torch.cuda.reset_peak_memory_stats(device)
+    is_cuda = device is not None and device.type == "cuda"
+    if is_cuda:
+        torch.cuda.synchronize(device)
+
+    if memory_enabled:
+        before_allocated = torch.cuda.memory_allocated(device)
+        before_reserved = torch.cuda.memory_reserved(device)
+        torch.cuda.reset_peak_memory_stats(device)
+    if time_enabled:
+        start = time.perf_counter()
 
     try:
         yield
     finally:
-        torch.cuda.synchronize(device)
-        measurements = {
-            "peak_allocated_gib": torch.cuda.max_memory_allocated(device) / gib,
-            "peak_reserved_gib": torch.cuda.max_memory_reserved(device) / gib,
-            "peak_extra_gib": (
-                torch.cuda.max_memory_allocated(device) - before_allocated
-            ) / gib,
-            "end_allocated_delta_gib": (
-                torch.cuda.memory_allocated(device) - before_allocated
-            ) / gib,
-            "end_reserved_delta_gib": (
-                torch.cuda.memory_reserved(device) - before_reserved
-            ) / gib,
-        }
-        for metric_name, value in measurements.items():
-            key = f"policy_memory/{name}/{metric_name}"
-            metrics[key] = max(metrics.get(key, float("-inf")), value)
+        if is_cuda:
+            torch.cuda.synchronize(device)
+
+        if memory_enabled:
+            gib = 2**30
+            measurements = {
+                "peak_allocated_gib": torch.cuda.max_memory_allocated(device) / gib,
+                "peak_reserved_gib": torch.cuda.max_memory_reserved(device) / gib,
+                "peak_extra_gib": (
+                    torch.cuda.max_memory_allocated(device) - before_allocated
+                ) / gib,
+                "end_allocated_delta_gib": (
+                    torch.cuda.memory_allocated(device) - before_allocated
+                ) / gib,
+                "end_reserved_delta_gib": (
+                    torch.cuda.memory_reserved(device) - before_reserved
+                ) / gib,
+            }
+            for metric_name, value in measurements.items():
+                key = f"policy_memory/{name}/{metric_name}"
+                memory_metrics[key] = max(
+                    memory_metrics.get(key, float("-inf")), value
+                )
+
+        if time_enabled:
+            key = f"time/{time_name or name}"
+            time_metrics[key] = (
+                time_metrics.get(key, 0.0) + time.perf_counter() - start
+            )
 
 
 def tokenize_prompt_and_output(
@@ -391,6 +420,7 @@ def grpo_train_step(
     loss_normalization: Literal["sequence", "constant"] = "sequence",
     normalization_constant: int | None = None,
     track_policy_memory: bool = False,
+    track_step_time: bool = False,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor | float]]:
     """Execute forward-and-backward passes, with gradient_accumulation_steps
     microbatches.
@@ -458,9 +488,16 @@ def grpo_train_step(
                 Dict with metadata from the underlying loss call, gradient norm
                 before clipping, and any other statistics you might want to log.
     """
+    time_metrics: dict[str, float] = {}
     # rewards should be computed outside of the gradient accumulation loop to make calculations of group-level stats (e.g., mean and std) simple
-    raw_rewards, raw_rewards_metadata = compute_rollout_rewards(reward_fn, rollout_responses, repeated_ground_truths)
-    advantages, advantages_metadata = compute_group_normalized_rewards(raw_rewards, group_size, baseline, advantage_eps, advantage_normalizer)
+    with track_cuda_memory_and_time(
+        "policy_rewards",
+        time_metrics=time_metrics,
+        track_memory=False,
+        track_time=track_step_time,
+    ):
+        raw_rewards, raw_rewards_metadata = compute_rollout_rewards(reward_fn, rollout_responses, repeated_ground_truths)
+        advantages, advantages_metadata = compute_group_normalized_rewards(raw_rewards, group_size, baseline, advantage_eps, advantage_normalizer)
     assert len(repeated_prompts) == len(rollout_responses) == len(repeated_ground_truths)
     batch_size = len(repeated_prompts)
     microbatch_size = batch_size // gradient_accumulation_steps  # NOTE: it's okay if batch_size / gradient_accumulation_steps is not an integer (see the note below)
@@ -476,15 +513,27 @@ def grpo_train_step(
         microbatch_advantages = advantages[i*microbatch_size:(i+1)*microbatch_size]
         microbatch_old_log_probs = old_log_probs[i*microbatch_size:(i+1)*microbatch_size] if old_log_probs else None
         # Tokenization (on CPU)
-        tokenized = tokenize_prompt_and_output(prompts, responses, tokenizer)  # a dict with keys "input_ids", "labels", and "response_mask"
+        with track_cuda_memory_and_time(
+            "policy_tokenization",
+            time_metrics=time_metrics,
+            track_memory=False,
+            track_time=track_step_time,
+        ):
+            tokenized = tokenize_prompt_and_output(prompts, responses, tokenizer)  # a dict with keys "input_ids", "labels", and "response_mask"
         if track_policy_memory:
             memory_metrics["policy_memory/max_sequence_length"] = max(
                 memory_metrics.get("policy_memory/max_sequence_length", 0),
                 float(tokenized["input_ids"].shape[1]),
             )
         # Get each prefix-conditioned response token's logprob (and optionally entropy), which is necessary for computing policy gradients
-        with track_cuda_memory(
-            "forward_logprobs", model_device, memory_metrics, track_policy_memory
+        with track_cuda_memory_and_time(
+            "forward_logprobs",
+            device=model_device,
+            memory_metrics=memory_metrics,
+            time_metrics=time_metrics,
+            time_name="policy_forward_logprobs",
+            track_memory=track_policy_memory,
+            track_time=track_step_time,
         ):
             response_token_logprobs = get_response_log_probs(  # two keys: ["log_probs", "token_entropy"], shape of the logprobs: (microbatch_size, max_sequence_length_in_this_microbatch)
                 model,
@@ -494,8 +543,14 @@ def grpo_train_step(
             )
         avg_entropy += response_token_logprobs["token_entropy"].mean().detach().cpu() * (len(prompts) / batch_size)
         # Compute policy-gradient loss
-        with track_cuda_memory(
-            "loss", model_device, memory_metrics, track_policy_memory
+        with track_cuda_memory_and_time(
+            "loss",
+            device=model_device,
+            memory_metrics=memory_metrics,
+            time_metrics=time_metrics,
+            time_name="policy_loss",
+            track_memory=track_policy_memory,
+            track_time=track_step_time,
         ):
             per_token_loss, per_token_loss_metadata = compute_policy_gradient_loss(
                 raw_rewards_or_advantages=microbatch_advantages.to(model_device),  # NOTE: remember to move to the same device!
@@ -511,22 +566,46 @@ def grpo_train_step(
                 loss_normalization=loss_normalization,
                 normalization_constant=normalization_constant
             ) * (per_token_loss.shape[0] / batch_size)  # NOTE: Important!!! Remember to rescale the loss to make the accumulated loss equivalent to the full-batch loss
-        with track_cuda_memory(
-            "backward", model_device, memory_metrics, track_policy_memory
+        with track_cuda_memory_and_time(
+            "backward",
+            device=model_device,
+            memory_metrics=memory_metrics,
+            time_metrics=time_metrics,
+            time_name="policy_backward",
+            track_memory=track_policy_memory,
+            track_time=track_step_time,
         ):
             microbatch_loss.backward()
         loss += microbatch_loss.detach().cpu()
 
-    with track_cuda_memory(
-        "grad_clip", model_device, memory_metrics, track_policy_memory
+    with track_cuda_memory_and_time(
+        "grad_clip",
+        device=model_device,
+        memory_metrics=memory_metrics,
+        time_metrics=time_metrics,
+        time_name="policy_grad_clip",
+        track_memory=track_policy_memory,
+        track_time=track_step_time,
     ):
         total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
-    with track_cuda_memory(
-        "optimizer_step", model_device, memory_metrics, track_policy_memory
+    with track_cuda_memory_and_time(
+        "optimizer_step",
+        device=model_device,
+        memory_metrics=memory_metrics,
+        time_metrics=time_metrics,
+        time_name="policy_optimizer_step",
+        track_memory=track_policy_memory,
+        track_time=track_step_time,
     ):
         optimizer.step()
-    with track_cuda_memory(
-        "zero_grad", model_device, memory_metrics, track_policy_memory
+    with track_cuda_memory_and_time(
+        "zero_grad",
+        device=model_device,
+        memory_metrics=memory_metrics,
+        time_metrics=time_metrics,
+        time_name="policy_zero_grad",
+        track_memory=track_policy_memory,
+        track_time=track_step_time,
     ):
         optimizer.zero_grad(set_to_none=True)
     metadata={
@@ -535,5 +614,6 @@ def grpo_train_step(
         "mean_total_reward": raw_rewards_metadata["mean_total_reward"],
         "mean_format_reward": raw_rewards_metadata["mean_format_reward"],
         "memory_metrics": memory_metrics,
+        "time_metrics": time_metrics,
     }
     return loss, metadata
