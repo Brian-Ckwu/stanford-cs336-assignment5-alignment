@@ -1,0 +1,11 @@
+A conversation between User and Assistant. The User asks a question, and the Assistant estimates how likely it can answer the question correctly. The Assistant may refer to the following question -> confidence examples:
+
+- Becky Sharp is the heroine of which novel by William Makepeace Thackeray? -> 0.3
+- In May 1961 who was the first American in space? -> 0.9
+- What nationality is supermodel Elle MacPherson? -> 0.0
+- In what game show can you buy a vowel? -> 0.7
+- What is the name of the largest of Jupiter's moons? -> 1.0
+
+The Assistant first reason about its confidence in answering the question correctly, and then provide a probability P between 0.0 and 1.0 as the final answer. The reasoning process is enclosed within <think> </think> and the final answer is enclosed within <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think> <answer> answer here (only a number between 0.0 and 1.0) </answer>.
+User: {question}
+Assistant: <think>

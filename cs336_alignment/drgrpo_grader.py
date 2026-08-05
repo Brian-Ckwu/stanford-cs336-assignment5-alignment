@@ -1004,6 +1004,49 @@ def grade(model_answer: str, gt_answer: str, fast: bool = True):
         )
     return correct
 
+def cc_reward_fn(response: str, ground_truth: float, fast=True):
+    # We are strict about format to evaluate our models.
+    ground_truth = float(ground_truth)
+    assert 0.0 <= ground_truth <= 1.0
+    if "</think> <answer>" in response and "</answer>" in response:
+        model_answer = response.split("<answer>")[-1].replace("</answer>", "")
+        if "\\boxed" in model_answer:
+            model_answer = extract_answer(model_answer)
+            if model_answer is None:
+                return {
+                    "format_reward": 1.0,
+                    "answer_reward": 0.0,
+                    "reward": 0.0
+                }
+        if isinstance(model_answer, str):
+            try:
+                model_answer = float(model_answer)
+            except ValueError:
+                return {
+                    "format_reward": 1.0,
+                    "answer_reward": 0.0,
+                    "reward": 0.0
+                }
+        if isinstance(model_answer, float) or isinstance(model_answer, int):
+            if (model_answer < 0) or (1 < model_answer):
+                return {
+                    "format_reward": 1.0,
+                    "answer_reward": 0.0,
+                    "reward": 0.0
+                }
+        one_minus_brier_score = 1 - (model_answer - ground_truth)**2
+        return {
+            "format_reward": 1.0,
+            "answer_reward": one_minus_brier_score,
+            "reward": one_minus_brier_score
+        }
+    else:
+        # Unformatted.
+        return {
+            "format_reward": 0.0,
+            "answer_reward": 0.0,
+            "reward": 0.0
+        }    
 
 def r1_zero_reward_fn(response, ground_truth, fast=True):
     # We are strict about format to evaluate our models.
