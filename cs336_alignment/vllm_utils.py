@@ -40,6 +40,7 @@ class VLLMServer:
     enable_lora: bool = False
     max_lora_rank: int = 16
     max_loras: int = 1
+    max_model_len: int = 1024
     launch_server: bool = True
     startup_timeout: int = 600
     shutdown_timeout: int = 30
@@ -66,6 +67,7 @@ class VLLMServer:
                 enable_lora=self.enable_lora,
                 max_lora_rank=self.max_lora_rank,
                 max_loras=self.max_loras,
+                max_model_len=self.max_model_len
             )
             atexit.register(self.stop)
         wait_for_server(self.base_url, self.process, self.startup_timeout)
@@ -171,6 +173,7 @@ def start_server(
     enable_lora: bool = False,
     max_lora_rank: int = 16,
     max_loras: int = 1,
+    max_model_len: int = 1024
 ) -> subprocess.Popen:
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = str(gpu)
@@ -201,6 +204,8 @@ def start_server(
         json.dumps({"backend": weight_transfer_backend}),
         "--load-format",
         load_format,
+        "--max_model_len",
+        str(max_model_len),
     ]
     if enable_lora:
         command.extend(

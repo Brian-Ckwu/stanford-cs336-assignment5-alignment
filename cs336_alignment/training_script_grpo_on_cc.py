@@ -24,6 +24,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gradient-accumulation-steps", type=int, default=32)
     parser.add_argument("--sampling-temperature", type=float, default=0.6)
     parser.add_argument("--sampling-max-tokens", type=int, default=256)
+    parser.add_argument("--sequence-max-tokens", type=int, default=1024)
     parser.add_argument("--sampling-stop", default="</answer>")
     parser.add_argument(
         "--include-stop-str-in-output",
@@ -102,6 +103,7 @@ group_size = args.group_size
 gradient_accumulation_steps = args.gradient_accumulation_steps
 sampling_temperature = args.sampling_temperature
 sampling_max_tokens = args.sampling_max_tokens
+sequence_max_tokens = args.sequence_max_tokens
 max_grad_norm = args.max_grad_norm
 adamw_betas = tuple(args.adamw_betas)
 weight_decay = args.weight_decay
@@ -212,6 +214,7 @@ llm_rollout = VLLMServer(
     enable_lora=use_peft,
     max_lora_rank=lora_r,
     max_loras=1,
+    max_model_len=sequence_max_tokens
 )
 print(f"Starting the rollout model (vLLM service)...")
 llm_rollout.start()
