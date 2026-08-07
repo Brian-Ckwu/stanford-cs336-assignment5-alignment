@@ -242,6 +242,7 @@ assert (rollout_batch_size / group_size).is_integer()
 n_questions_per_rollout = rollout_batch_size // group_size
 print(f"Rollout batch size: {rollout_batch_size}; # Questions per rollout: {n_questions_per_rollout}; # Generations per question: {group_size}")
 
+import gc
 from tqdm import tqdm
 
 for i in tqdm(range(num_rollout_steps), desc="GRPO training steps"):
@@ -299,6 +300,9 @@ for i in tqdm(range(num_rollout_steps), desc="GRPO training steps"):
             track_policy_memory=track_policy_memory,
             track_step_time=track_step_time,
         )
+    gcnt = gc.collect()
+    torch.cuda.empty_cache()
+    print(f"Memory released! ({gcnt} garbages collected)")
     # Sync weights
     print("Syncing weights of the rollout LLM to be the same with the updated policy LLM...")
     sync_memory_metrics = {}
