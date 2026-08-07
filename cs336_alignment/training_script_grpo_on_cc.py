@@ -9,6 +9,7 @@ def parse_args() -> argparse.Namespace:
         default="Qwen/Qwen3-1.7B_lr-3e-5_lora-r-16-a-32-dropout-0-fp32",
     )
     parser.add_argument("--model-id", default="Qwen/Qwen3-1.7B")
+    parser.add_argument("--dataset_path", type=str, required=True)
     parser.add_argument("--policy-device", type=int, default=2)
     parser.add_argument("--rollout-device", type=int, default=3)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
@@ -156,7 +157,7 @@ with open(prompt_path) as f:
     prompt_template = f.read()
 
 full_dataset = list()
-with open("../data/capability_calibration/triviaqa-train__Qwen3-1_7B-non-thinking/grpo_dataset.jsonl") as f:
+with open(args.dataset_path) as f:
     for line in f:
         row = json.loads(line)
         row["prompt"] = prompt_template.format(question=row["query"])
