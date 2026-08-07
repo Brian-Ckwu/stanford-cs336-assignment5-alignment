@@ -10,26 +10,19 @@ dependencies = [
     "modal>=1.1.0",
     "pytest>=8.3.5",
     "pylatexenc>=2.10",
-    "torch",
+    "torch==2.10.0",
     "transformers>=4.50.0",
     "typer>=0.15.4",
+    "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.19.1/vllm-0.19.1%2Bcu130-cp38-abi3-manylinux_2_35_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
     "vllm==0.19.1 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "xopen>=2.0.2",
     "ipykernel>=7.3.0",
     "peft>=0.19.1",
-]
-
-[project.optional-dependencies]
-gpu = [
     "alpaca-eval>=0.6.6",
-    # No official flash-attn 2.8.3 wheel exists for Torch 2.10; use the
-    # community cp312/cu12/Torch 2.10 wheel to avoid source builds on Modal.
+    "wandb>=0.26.0",
+    # flash-attn wheels are specific to the CPU architecture and CUDA version.
+    "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3%2Bcu13torch2.10cxx11abiTRUE-cp312-cp312-linux_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
     "flash-attn @ https://github.com/lesj0610/flash-attention/releases/download/v2.8.3-cu12-torch2.10-cp312/flash_attn-2.8.3%2Bcu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
-    "torch",
-    "wandb>=0.26.0",
-]
-plots = [
-    "wandb>=0.26.0",
 ]
 
 [tool.setuptools.packages.find]
@@ -38,16 +31,22 @@ include = ["cs336_alignment*"]
 [tool.uv]
 package = true
 environments = [
+    "sys_platform == 'linux' and platform_machine == 'aarch64'",
     "sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 
 [tool.uv.sources]
 torch = [
-    { index = "pytorch-cu129", extra = "gpu", marker = "sys_platform == 'linux'" },
+    { index = "pytorch-cu129", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
+    { index = "pytorch-cu130", marker = "sys_platform == 'linux' and platform_machine == 'aarch64'" },
 ]
 [[tool.uv.index]]
 name = "pytorch-cu129"
 url = "https://download.pytorch.org/whl/cu129"
+explicit = true
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
 [tool.pytest.ini_options]
