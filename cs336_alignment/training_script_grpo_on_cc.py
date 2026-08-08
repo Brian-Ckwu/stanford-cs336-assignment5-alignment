@@ -144,11 +144,15 @@ wandb_config = {
 wandb_run = wandb.init(project=wandb_project_name, name=wandb_exp_name, config=wandb_config)
 
 # Seeding
-import torch
 import random
 
-# TODO: Set random seeds for numpy, torch, ...
+import numpy as np
+import torch
+
 random.seed(seed)
+np.random.seed(seed)
+torch.manual_seed(seed)
+torch.cuda.manual_seed_all(seed)
 
 # Load dataset
 import json
@@ -195,6 +199,8 @@ if use_peft:
         if "lora_" in name
     }
     print(f"LoRA dtype: {lora_dtype}")
+else:
+    print("Running the experiment with full-weight fine-tuning...")
 
 optimizer = torch.optim.AdamW(
     (p for p in llm_policy.parameters() if p.requires_grad),

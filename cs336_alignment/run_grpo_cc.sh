@@ -8,7 +8,7 @@ lr=1e-5
 # _lora-r-16-a-32-dropout-0-bf16
 uv run training_script_grpo_on_cc.py \
   --wandb-project-name "GRPO_CC_TriviaQA" \
-  --wandb-exp-name "${model_id}_lr-${lr}_lora-r-16-a-32-dropout-0-bf16_h100" \
+  --wandb-exp-name "${model_id}_lr-${lr}_full-weight-ft_h100" \
   --model-id "${model_id}" \
   --dataset_path "../data/capability_calibration/triviaqa-train__Qwen3-8B-non-thinking/grpo_dataset.jsonl" \
   --policy-device 0 \
@@ -32,7 +32,7 @@ uv run training_script_grpo_on_cc.py \
   --weight-decay 0.0 \
   --seed 42 \
   --track-policy-memory \
-  --use-peft \
+  --no-use-peft \
   --peft-method lora \
   --lora-r 16 \
   --lora-alpha 32 \
