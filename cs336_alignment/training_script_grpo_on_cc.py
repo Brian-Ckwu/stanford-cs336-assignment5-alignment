@@ -243,13 +243,38 @@ from grpo_core_implementation import grpo_train_step, track_cuda_memory_and_time
 from drgrpo_grader import cc_reward_fn
 
 # NOTE: currently just train for one epoch to avoid overfitting, so I add the following check
-assert num_rollout_steps * rollout_batch_size == n_train_examples * group_size
-assert (rollout_batch_size / group_size).is_integer()
+assert num_rollout_steps * rollout_batch_size == len(train_dataset) * group_size
 n_questions_per_rollout = rollout_batch_size // group_size
 print(f"Rollout batch size: {rollout_batch_size}; # Questions per rollout: {n_questions_per_rollout}; # Generations per question: {group_size}")
 
 import gc
 from tqdm import tqdm
+from evaluation_with_cc import validate_llm_rollout
+
+validation_sampling_params = {
+    **sampling_params,
+    "temperature": 0.6,
+    "top_p": 0.95,
+    "n": 1,
+}
+print(f"Validating the initial LLM policy...")
+valid_metrics = validate_llm_rollout(
+    llm_rollout,
+    valid_dataset,
+    sampling_params=validation_sampling_params,
+    batch_size=rollout_batch_size,
+)
+print(f"Validation metrics at step 0: {json.dumps(valid_metrics, sort_keys=True)}")
+wandb_run.log(
+    data={
+        "valid/mse": valid_metrics["mse"],
+        "valid/spearman_r": valid_metrics["spearman_r"],
+        "valid/num_invalid": valid_metrics["num_invalid"],
+        "valid/num_total": valid_metrics["num_total"],
+    },
+    step=0,
+)
+max_spearman = valid_metrics["spearman_r"]
 
 for i in tqdm(range(num_rollout_steps), desc="GRPO training steps"):
     time_metrics = {}
@@ -337,13 +362,40 @@ for i in tqdm(range(num_rollout_steps), desc="GRPO training steps"):
     memory_metrics.update(sync_memory_metrics)
     time_metrics.update(train_step_metadata.pop("time_metrics"))
     print("Syncing done!")
+    if (i + 1) % 10 == 0:
+        print(f"Validating the LLM policy at step {i + 1}...")
+        valid_metrics = validate_llm_rollout(
+            llm_rollout,
+            valid_dataset,
+            sampling_params=validation_sampling_params,
+            batch_size=rollout_batch_size,
+        )
+        print(
+            f"Validation metrics at step {i + 1}: "
+            f"{json.dumps(valid_metrics, sort_keys=True)}"
+        )
+        if valid_metrics["spearman_r"] > max_spearman:
+            print(f'Current Spearman corr better than prev best: {valid_metrics["spearman_r"]:.4f} > {max_spearman:.4f}')
+            max_spearman = valid_metrics["spearman_r"]
+            output_dir = f"checkpoints/{wandb_exp_name}-best-spearman"
+            tokenizer.save_pretrained(output_dir)
+            llm_policy.save_pretrained(output_dir, safe_serialization=True)
+        wandb_run.log(
+            data={
+                "valid/mse": valid_metrics["mse"],
+                "valid/spearman_r": valid_metrics["spearman_r"],
+                "valid/num_invalid": valid_metrics["num_invalid"],
+                "valid/num_total": valid_metrics["num_total"],
+            },
+            step=i,
+            commit=False,
+        )
     wandb_run.log(data={
         "train/loss": train_step_loss,
         **{f"train/{key}": value for key, value in train_step_metadata.items()},
         **memory_metrics,
         **time_metrics,
     }, step=i)
-    # TODO: validation
 
 # Closing
 llm_rollout.stop()
@@ -352,10 +404,6 @@ if runtime_adapter_dir is not None:
 
 output_dir = f"checkpoints/{wandb_exp_name}-final"
 tokenizer.save_pretrained(output_dir)
-if use_peft:  # NOTE: currently save the full merged model instead of the adapter only
-    merged = llm_policy.merge_and_unload()  # XXX: understand this
-    merged.save_pretrained(output_dir, safe_serialization=True)
-else:
-    llm_policy.save_pretrained(output_dir, safe_serialization=True)
+llm_policy.save_pretrained(output_dir, safe_serialization=True)
 
 wandb_run.finish()
