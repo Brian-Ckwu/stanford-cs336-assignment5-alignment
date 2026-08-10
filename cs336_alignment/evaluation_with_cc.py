@@ -8,11 +8,15 @@ import json
 import math
 import os
 import random
-import re
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Literal, Mapping, Sequence
 
 import numpy as np
+
+try:
+    from .calibration_utils import ConfidenceOutputFormat, parse_confidence
+except ImportError:  # Support direct execution from cs336_alignment/.
+    from calibration_utils import ConfidenceOutputFormat, parse_confidence
 
 
 DEFAULT_SAMPLING_PARAMS: dict[str, Any] = {
@@ -167,56 +171,6 @@ def build_prompts(rows: Sequence[Mapping[str, Any]], prompt_template: str) -> li
     return [prompt_template.format(question=row["query"]) for row in rows]
 
 
-def extract_boxed_answer(text: str) -> str | None:
-    start = text.find(r"\boxed{")
-    if start < 0:
-        return None
-    index = start + len(r"\boxed{")
-    depth = 1
-    chars = []
-    while index < len(text):
-        char = text[index]
-        if char == "{":
-            depth += 1
-            chars.append(char)
-        elif char == "}":
-            depth -= 1
-            if depth == 0:
-                return "".join(chars).strip()
-            chars.append(char)
-        else:
-            chars.append(char)
-        index += 1
-    return None
-
-
-_NUMBER_RE = re.compile(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)")
-
-
-def parse_confidence(response: str) -> tuple[float | None, str | None]:
-    """Extract a confidence in [0, 1] from a model response."""
-    text = response.strip()
-    match = re.search(r"<answer>\s*(.*?)\s*(?:</answer>|$)", text, flags=re.DOTALL)
-    answer_text = match.group(1).strip() if match is not None else extract_boxed_answer(text)
-    if answer_text is None:
-        return None, "missing_answer_tag"
-    boxed = extract_boxed_answer(answer_text)
-    if boxed is not None:
-        answer_text = boxed
-    try:
-        value = float(answer_text)
-    except ValueError:
-        numbers = _NUMBER_RE.findall(answer_text)
-        if len(numbers) != 1:
-            return None, "answer_not_single_number"
-        value = float(numbers[0])
-    if not math.isfinite(value):
-        return None, "answer_not_finite"
-    if value < 0.0 or value > 1.0:
-        return None, "answer_out_of_range"
-    return value, None
-
-
 def _rank(values: np.ndarray) -> np.ndarray:
     sorted_indices = np.argsort(values)
     ranks = np.zeros_like(values, dtype=float)
@@ -303,6 +257,7 @@ def materialize_predictions(
     prompts: Sequence[str],
     responses: Sequence[str],
     invalid_policy: str,
+    output_format: ConfidenceOutputFormat | Literal["auto"] = "auto",
 ) -> tuple[list[dict[str, Any]], list[float], list[float], int]:
     if not (len(rows) == len(prompts) == len(responses)):
         raise ValueError("Rows, prompts, and responses must have the same length.")
@@ -312,7 +267,7 @@ def materialize_predictions(
     invalid_count = 0
     for row, prompt, response in zip(rows, prompts, responses):
         target = _row_target(row)
-        parsed, parse_error = parse_confidence(response)
+        parsed, parse_error = parse_confidence(response, output_format=output_format)
         if parsed is None:
             invalid_count += 1
             if invalid_policy == "error":
@@ -365,7 +320,9 @@ def _validation_prompts(
 ) -> list[str]:
     prompts = []
     for row in valid_dataset:
-        if "prompt" in row:
+        if "model_prompt" in row:
+            prompts.append(str(row["model_prompt"]))
+        elif "prompt" in row:
             prompts.append(str(row["prompt"]))
         elif prompt_template is not None and "query" in row:
             prompts.append(prompt_template.format(question=row["query"]))
@@ -391,6 +348,7 @@ def validate_llm_rollout(
     batch_size: int | None = None,
     invalid_policy: str = "zero",
     prompt_template: str | None = None,
+    output_format: ConfidenceOutputFormat = "answer_tags",
 ) -> dict[str, float | int]:
     """Generate one confidence per validation row and return aggregate metrics.
 
@@ -424,6 +382,7 @@ def validate_llm_rollout(
         prompts,
         responses,
         invalid_policy,
+        output_format,
     )
     metrics = compute_metrics(predictions, targets)
     metrics.update(
