@@ -14,9 +14,19 @@ from typing import Any, Literal, Mapping, Sequence
 import numpy as np
 
 try:
-    from .calibration_utils import ConfidenceOutputFormat, parse_confidence
+    from .calibration_utils import (
+        ConfidenceOutputFormat,
+        configure_chat_template,
+        parse_confidence,
+        render_user_prompt,
+    )
 except ImportError:  # Support direct execution from cs336_alignment/.
-    from calibration_utils import ConfidenceOutputFormat, parse_confidence
+    from calibration_utils import (
+        ConfidenceOutputFormat,
+        configure_chat_template,
+        parse_confidence,
+        render_user_prompt,
+    )
 
 
 DEFAULT_SAMPLING_PARAMS: dict[str, Any] = {
@@ -42,6 +52,23 @@ def parse_args() -> argparse.Namespace:
         help="One or more JSONL files with query and expected_accuracy fields.",
     )
     parser.add_argument("--prompt_path", required=True, help="Prompt template containing {question}.")
+    parser.add_argument(
+        "--use_chat_template",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Render each formatted prompt as one user chat message.",
+    )
+    parser.add_argument(
+        "--chat_template_path",
+        default=None,
+        help="Optional Jinja chat-template override. Requires --use_chat_template.",
+    )
+    parser.add_argument(
+        "--confidence_output_format",
+        choices=("auto", "answer_tags", "boxed"),
+        default="auto",
+        help="Output contract used when parsing confidence predictions.",
+    )
     parser.add_argument("--vllm_device", default=0, help="CUDA device id, or comma-separated ids.")
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.9)
     parser.add_argument("--output_metrics_jsonl", default="cc_metrics.json")
@@ -167,8 +194,21 @@ def load_dataset(
     return rows
 
 
-def build_prompts(rows: Sequence[Mapping[str, Any]], prompt_template: str) -> list[str]:
-    return [prompt_template.format(question=row["query"]) for row in rows]
+def build_prompts(
+    rows: Sequence[Mapping[str, Any]],
+    prompt_template: str,
+    *,
+    tokenizer: Any | None = None,
+    use_chat_template: bool = False,
+) -> list[str]:
+    return [
+        render_user_prompt(
+            tokenizer,
+            prompt_template.format(question=row["query"]),
+            use_chat_template=use_chat_template,
+        )
+        for row in rows
+    ]
 
 
 def _rank(values: np.ndarray) -> np.ndarray:
@@ -522,6 +562,12 @@ def main() -> None:
     args.model_folder = str(resolve_existing_path(args.model_folder, repo_root=repo_root))
     dataset_paths = resolve_existing_paths(args.test_data_jsonl, repo_root=repo_root)
     prompt_path = resolve_existing_path(args.prompt_path, repo_root=repo_root)
+    if args.chat_template_path is not None:
+        args.chat_template_path = str(
+            resolve_existing_path(args.chat_template_path, repo_root=repo_root)
+        )
+    if args.chat_template_path is not None and not args.use_chat_template:
+        raise ValueError("--chat_template_path requires --use_chat_template.")
     metrics_filename = validate_output_filename(
         args.output_metrics_jsonl,
         argument_name="--output_metrics_jsonl",
@@ -534,6 +580,21 @@ def main() -> None:
     traces_paths = build_output_paths(dataset_paths, traces_filename)
     prompt_template = load_prompt_template(prompt_path)
     print(f"Using prompt template {prompt_path}")
+    prompt_tokenizer = None
+    if args.use_chat_template:
+        from transformers import AutoTokenizer
+
+        prompt_tokenizer = AutoTokenizer.from_pretrained(
+            args.model_folder,
+            trust_remote_code=args.trust_remote_code,
+        )
+        configure_chat_template(
+            prompt_tokenizer,
+            use_chat_template=True,
+            chat_template_path=args.chat_template_path,
+        )
+        template_description = args.chat_template_path or "saved with the model"
+        print(f"Rendering prompts with chat template {template_description}")
     original_model_folder = args.model_folder
     merged_model_dir = None
     try:
@@ -559,7 +620,12 @@ def main() -> None:
                 start_index=args.start_index,
                 limit=args.limit,
             )
-            prompts = build_prompts(rows, prompt_template)
+            prompts = build_prompts(
+                rows,
+                prompt_template,
+                tokenizer=prompt_tokenizer,
+                use_chat_template=args.use_chat_template,
+            )
             print(f"[{dataset_index}/{len(dataset_paths)}] Loaded {len(rows)} examples from {dataset_path}")
             responses = generate_with_vllm(llm, sampling_params, prompts)
             records, predictions, targets, invalid_count = materialize_predictions(
@@ -567,6 +633,7 @@ def main() -> None:
                 prompts,
                 responses,
                 args.invalid_policy,
+                args.confidence_output_format,
             )
             metrics = compute_metrics(predictions, targets)
             metrics.update(
