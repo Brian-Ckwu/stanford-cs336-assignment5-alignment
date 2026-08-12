@@ -1,0 +1,16 @@
+Question: {question}
+
+How likely are you to answer the question correctly? You may refer to the following linguistic expression of uncertainty:
+
+- "Almost no chance"
+- "Highly unlikely"
+- "Chances are slight"
+- "Unlikely"
+- "Less than even"
+- "Better than even"
+- "Likely"
+- "Very good chance"
+- "Highly likely"
+- "Almost certain"
+
+Reason about your uncertainty and confidence in the question, and then provide your linguistic expression of uncertainty in the format of <answer> "linguistic_uncertainty" </answer>.
