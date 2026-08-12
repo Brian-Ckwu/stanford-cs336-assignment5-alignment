@@ -13,7 +13,7 @@ import math
 import os
 import random
 from pathlib import Path
-from typing import Any, Iterator, Mapping, Sequence
+from typing import Any, Iterator, Literal, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -35,6 +35,12 @@ except ImportError:  # Support direct execution from cs336_alignment/.
 REGRESSION_CONFIG_FILENAME = "regression_config.json"
 REGRESSION_HEAD_FILENAME = "regression_head.pt"
 BACKBONE_DIRECTORY = "backbone"
+OptimizationMode = Literal["sigmoid_mse", "linear_mse", "bce_with_logits"]
+OPTIMIZATION_MODES: tuple[OptimizationMode, ...] = (
+    "sigmoid_mse",
+    "linear_mse",
+    "bce_with_logits",
+)
 
 
 def _backbone_hidden_size(backbone: nn.Module) -> int:
@@ -50,9 +56,16 @@ def _backbone_hidden_size(backbone: nn.Module) -> int:
 class RegressionWithLLMBackbone(nn.Module):
     """Decoder-only LLM with a scalar regression head on its final token."""
 
-    def __init__(self, backbone: nn.Module) -> None:
+    def __init__(
+        self,
+        backbone: nn.Module,
+        optimization_mode: OptimizationMode = "sigmoid_mse",
+    ) -> None:
         super().__init__()
+        if optimization_mode not in OPTIMIZATION_MODES:
+            raise ValueError(f"Unknown optimization mode: {optimization_mode}")
         self.backbone = backbone
+        self.optimization_mode = optimization_mode
         # MSE on probabilities benefits from fp32; casting one vector is cheap.
         self.regression_head = nn.Linear(
             _backbone_hidden_size(backbone),
@@ -60,7 +73,7 @@ class RegressionWithLLMBackbone(nn.Module):
             dtype=torch.float32,
         )
 
-    def forward(
+    def forward_scores(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
@@ -93,8 +106,38 @@ class RegressionWithLLMBackbone(nn.Module):
 
         batch_indices = torch.arange(batch_size, device=hidden_states.device)
         pooled = hidden_states[batch_indices, last_token_indices]
-        logits = self.regression_head(pooled.float()).squeeze(-1)
-        return torch.sigmoid(logits)
+        return self.regression_head(pooled.float()).squeeze(-1)
+
+    def scores_to_predictions(self, scores: torch.Tensor) -> torch.Tensor:
+        """Convert head scores to valid probabilities for evaluation/inference."""
+        if self.optimization_mode == "linear_mse":
+            return scores.clamp(0.0, 1.0)
+        return torch.sigmoid(scores)
+
+    def compute_loss(
+        self,
+        scores: torch.Tensor,
+        targets: torch.Tensor,
+        *,
+        reduction: Literal["mean", "sum"] = "mean",
+    ) -> torch.Tensor:
+        if self.optimization_mode == "sigmoid_mse":
+            return F.mse_loss(
+                torch.sigmoid(scores), targets, reduction=reduction
+            )
+        if self.optimization_mode == "linear_mse":
+            return F.mse_loss(scores, targets, reduction=reduction)
+        return F.binary_cross_entropy_with_logits(
+            scores, targets, reduction=reduction
+        )
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        scores = self.forward_scores(input_ids, attention_mask)
+        return self.scores_to_predictions(scores)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -131,6 +174,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--n-val-examples", type=int, default=1024)
     parser.add_argument("--num-train-epochs", type=int, default=1)
     parser.add_argument("--learning-rate", type=float, default=1e-5)
+    parser.add_argument(
+        "--optimization-mode",
+        choices=OPTIMIZATION_MODES,
+        default="sigmoid_mse",
+        help=(
+            "Head objective: sigmoid_mse applies MSE to sigmoid probabilities; "
+            "linear_mse applies MSE to raw scores and clips only for evaluation; "
+            "bce_with_logits applies BCEWithLogitsLoss and sigmoid for evaluation."
+        ),
+    )
     parser.add_argument(
         "--train-batch-size",
         type=int,
@@ -389,7 +442,7 @@ def regression_train_step(
     max_grad_norm: float,
     device: torch.device,
 ) -> tuple[float, dict[str, float]]:
-    """Run one update whose gradients equal a full-batch mean-MSE update."""
+    """Run one update equivalent to evaluating the selected loss on the full batch."""
     if not rows:
         raise ValueError("A training batch cannot be empty.")
     model.train()
@@ -407,8 +460,9 @@ def regression_train_step(
             device=device,
         )
         max_sequence_length = max(max_sequence_length, inputs["input_ids"].shape[1])
-        predictions = model(**inputs)
-        microbatch_loss_sum = F.mse_loss(predictions, targets, reduction="sum")
+        scores = model.forward_scores(**inputs)
+        predictions = model.scores_to_predictions(scores)
+        microbatch_loss_sum = model.compute_loss(scores, targets, reduction="sum")
         (microbatch_loss_sum / batch_size).backward()
         summed_loss += microbatch_loss_sum.detach()
         prediction_sum += predictions.detach().sum()
@@ -480,7 +534,10 @@ def save_regression_checkpoint(
         "base_model_id": model_id,
         "backbone_directory": BACKBONE_DIRECTORY,
         "head_filename": REGRESSION_HEAD_FILENAME,
-        "output_activation": "sigmoid",
+        "optimization_mode": model.optimization_mode,
+        "output_activation": (
+            "clip" if model.optimization_mode == "linear_mse" else "sigmoid"
+        ),
         "pooling": "last_non_padding_token",
         "use_peft": use_peft,
     }
@@ -520,7 +577,10 @@ def load_regression_checkpoint(
         backbone = PeftModel.from_pretrained(backbone, backbone_path)
     else:
         backbone = AutoModel.from_pretrained(backbone_path, **model_kwargs)
-    model = RegressionWithLLMBackbone(backbone).to(resolved_device)
+    model = RegressionWithLLMBackbone(
+        backbone,
+        optimization_mode=config.get("optimization_mode", "sigmoid_mse"),
+    ).to(resolved_device)
     head_state = torch.load(
         checkpoint_path / config["head_filename"],
         map_location=resolved_device,
@@ -632,7 +692,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         if hasattr(backbone, "enable_input_require_grads"):
             backbone.enable_input_require_grads()
 
-    model = RegressionWithLLMBackbone(backbone).to(device)
+    model = RegressionWithLLMBackbone(
+        backbone,
+        optimization_mode=args.optimization_mode,
+    ).to(device)
     optimizer = torch.optim.AdamW(
         (parameter for parameter in model.parameters() if parameter.requires_grad),
         lr=args.learning_rate,
