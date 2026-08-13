@@ -173,7 +173,24 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--n-train-examples", type=int, default=6400)
     parser.add_argument("--n-val-examples", type=int, default=1024)
     parser.add_argument("--num-train-epochs", type=int, default=1)
-    parser.add_argument("--learning-rate", type=float, default=1e-5)
+    parser.add_argument(
+        "--learning-rate",
+        type=float,
+        default=1e-5,
+        help="Backward-compatible default for both backbone and regression-head LR.",
+    )
+    parser.add_argument(
+        "--backbone-learning-rate",
+        type=float,
+        default=None,
+        help="Backbone LR. Defaults to --learning-rate.",
+    )
+    parser.add_argument(
+        "--head-learning-rate",
+        type=float,
+        default=None,
+        help="Regression-head LR. Defaults to --learning-rate.",
+    )
     parser.add_argument(
         "--optimization-mode",
         choices=OPTIMIZATION_MODES,
@@ -210,6 +227,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", default="checkpoints")
+    parser.add_argument(
+        "--save-final-checkpoint",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Save a separate final checkpoint in addition to the best-Spearman one.",
+    )
     parser.add_argument(
         "--dtype",
         choices=("bfloat16", "float32"),
@@ -277,8 +300,13 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError(f"{name} must be positive.")
     if args.validation_interval < 0:
         raise ValueError("--validation-interval must be non-negative.")
-    if args.learning_rate <= 0.0:
-        raise ValueError("--learning-rate must be positive.")
+    for name, value in (
+        ("--learning-rate", args.learning_rate),
+        ("--backbone-learning-rate", args.backbone_learning_rate),
+        ("--head-learning-rate", args.head_learning_rate),
+    ):
+        if value is not None and value <= 0.0:
+            raise ValueError(f"{name} must be positive.")
     if args.max_grad_norm <= 0.0:
         raise ValueError("--max-grad-norm must be positive.")
     if args.gradient_accumulation_steps > args.train_batch_size:
@@ -519,6 +547,7 @@ def save_regression_checkpoint(
     model_id: str,
     use_peft: bool,
     training_args: Mapping[str, Any] | None = None,
+    validation_metrics: Mapping[str, float | int] | None = None,
 ) -> None:
     output_path = Path(output_dir)
     backbone_path = output_path / BACKBONE_DIRECTORY
@@ -543,6 +572,8 @@ def save_regression_checkpoint(
     }
     if training_args is not None:
         config["training_args"] = dict(training_args)
+    if validation_metrics is not None:
+        config["validation_metrics"] = dict(validation_metrics)
     (output_path / REGRESSION_CONFIG_FILENAME).write_text(
         json.dumps(config, indent=2, sort_keys=True) + "\n"
     )
@@ -696,9 +727,35 @@ def main(argv: Sequence[str] | None = None) -> None:
         backbone,
         optimization_mode=args.optimization_mode,
     ).to(device)
+    backbone_learning_rate = (
+        args.backbone_learning_rate
+        if args.backbone_learning_rate is not None
+        else args.learning_rate
+    )
+    head_learning_rate = (
+        args.head_learning_rate
+        if args.head_learning_rate is not None
+        else args.learning_rate
+    )
     optimizer = torch.optim.AdamW(
-        (parameter for parameter in model.parameters() if parameter.requires_grad),
-        lr=args.learning_rate,
+        [
+            {
+                "params": [
+                    parameter
+                    for parameter in model.backbone.parameters()
+                    if parameter.requires_grad
+                ],
+                "lr": backbone_learning_rate,
+            },
+            {
+                "params": [
+                    parameter
+                    for parameter in model.regression_head.parameters()
+                    if parameter.requires_grad
+                ],
+                "lr": head_learning_rate,
+            },
+        ],
         betas=tuple(args.adamw_betas),
         weight_decay=args.weight_decay,
     )
@@ -708,6 +765,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     run_config = vars(args).copy()
     run_config["resolved_device"] = str(device)
     run_config["resolved_prompt_path"] = str(prompt_path)
+    run_config["resolved_backbone_learning_rate"] = backbone_learning_rate
+    run_config["resolved_head_learning_rate"] = head_learning_rate
     wandb_run = wandb.init(
         project=args.wandb_project_name,
         name=args.wandb_exp_name,
@@ -715,13 +774,20 @@ def main(argv: Sequence[str] | None = None) -> None:
         mode=args.wandb_mode,
     )
 
-    checkpoint_prefix = Path(args.output_dir) / args.wandb_exp_name
+    checkpoint_prefix = (
+        Path(args.output_dir) / f"{args.wandb_exp_name}-run-{wandb_run.id}"
+    )
     best_spearman = float("-inf")
+    best_mse: float | None = None
+    best_step: int | None = None
     last_validation_step = -1
     training_args = vars(args).copy()
+    training_args["wandb_run_id"] = wandb_run.id
+    training_args["resolved_backbone_learning_rate"] = backbone_learning_rate
+    training_args["resolved_head_learning_rate"] = head_learning_rate
 
     def validate_and_maybe_save(step: int, *, allow_checkpoint: bool) -> None:
-        nonlocal best_spearman, last_validation_step
+        nonlocal best_mse, best_spearman, best_step, last_validation_step
         metrics = validate_regression_model(
             model,
             tokenizer,
@@ -731,9 +797,12 @@ def main(argv: Sequence[str] | None = None) -> None:
             device=device,
         )
         print(f"Validation metrics at step {step}: {json.dumps(metrics, sort_keys=True)}")
-        wandb_run.log(_wandb_validation_metrics(metrics), step=step)
         spearman = float(metrics["spearman_r"])
+        mse = float(metrics["mse"])
         if allow_checkpoint and spearman > best_spearman:
+            best_spearman = spearman
+            best_mse = mse
+            best_step = step
             print(f"New best validation Spearman correlation: {spearman:.4f}")
             save_regression_checkpoint(
                 f"{checkpoint_prefix}-best-spearman",
@@ -742,8 +811,23 @@ def main(argv: Sequence[str] | None = None) -> None:
                 model_id=args.model_id,
                 use_peft=args.use_peft,
                 training_args=training_args,
+                validation_metrics={
+                    "valid/step": best_step,
+                    "valid/spearman_r": best_spearman,
+                    "valid/mse": best_mse,
+                },
             )
-        best_spearman = max(best_spearman, spearman)
+        validation_log = _wandb_validation_metrics(metrics)
+        if best_step is not None:
+            validation_log.update(
+                {
+                    # These three values always describe the same selected checkpoint.
+                    "valid/step": best_step,
+                    "valid/best_spearman_r": best_spearman,
+                    "valid/best_mse": best_mse,
+                }
+            )
+        wandb_run.log(validation_log, step=step)
         last_validation_step = step
 
     try:
@@ -800,14 +884,15 @@ def main(argv: Sequence[str] | None = None) -> None:
             if last_validation_step != global_step:
                 validate_and_maybe_save(global_step, allow_checkpoint=True)
 
-        save_regression_checkpoint(
-            f"{checkpoint_prefix}-final",
-            model,
-            tokenizer,
-            model_id=args.model_id,
-            use_peft=args.use_peft,
-            training_args=training_args,
-        )
+        if args.save_final_checkpoint:
+            save_regression_checkpoint(
+                f"{checkpoint_prefix}-final",
+                model,
+                tokenizer,
+                model_id=args.model_id,
+                use_peft=args.use_peft,
+                training_args=training_args,
+            )
     finally:
         wandb_run.finish()
 
