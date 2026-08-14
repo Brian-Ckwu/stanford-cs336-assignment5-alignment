@@ -13,6 +13,9 @@ from typing import Any, Literal, Mapping, Sequence
 
 import numpy as np
 
+
+REGRESSION_CONFIG_FILENAME = "regression_config.json"
+
 try:
     from .calibration_utils import (
         ConfidenceOutputFormat,
@@ -44,7 +47,16 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Evaluate capability-calibration predictions against expected_accuracy."
     )
-    parser.add_argument("--model_folder", required=True, help="HF/vLLM model folder to evaluate.")
+    parser.add_argument("--model_folder", required=True, help="Model or regression-checkpoint folder.")
+    parser.add_argument(
+        "--inference_mode",
+        choices=("auto", "generative", "regression"),
+        default="auto",
+        help=(
+            "Inference backend. 'auto' selects regression when regression_config.json "
+            "is present, otherwise generative vLLM inference."
+        ),
+    )
     parser.add_argument(
         "--test_data_jsonl",
         required=True,
@@ -100,6 +112,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_model_len", type=int, default=None)
     parser.add_argument("--tensor_parallel_size", type=int, default=None)
     parser.add_argument("--vllm_logging_level", default="ERROR")
+    parser.add_argument(
+        "--regression_batch_size",
+        type=int,
+        default=32,
+        help="Batch size for regression-head inference.",
+    )
+    parser.add_argument(
+        "--sequence_max_tokens",
+        type=int,
+        default=None,
+        help=(
+            "Maximum input length for regression inference. Defaults to the value "
+            "saved in regression_config.json, or 1024 for older checkpoints."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -542,6 +569,136 @@ def generate_with_vllm(llm: Any, sampling_params: Any, prompts: list[str]) -> li
     return [output.outputs[0].text for output in outputs]
 
 
+def resolve_inference_mode(model_folder: str | Path, requested_mode: str) -> str:
+    is_regression_checkpoint = (
+        Path(model_folder) / REGRESSION_CONFIG_FILENAME
+    ).is_file()
+    if requested_mode == "auto":
+        return "regression" if is_regression_checkpoint else "generative"
+    if requested_mode == "regression" and not is_regression_checkpoint:
+        raise ValueError(
+            "--inference_mode regression requires a checkpoint containing "
+            f"{REGRESSION_CONFIG_FILENAME}: {model_folder}"
+        )
+    if requested_mode == "generative" and is_regression_checkpoint:
+        raise ValueError(
+            "A regression checkpoint cannot be evaluated through generative vLLM "
+            "inference. Use --inference_mode regression (or auto)."
+        )
+    return requested_mode
+
+
+def initialize_regression_model(
+    checkpoint_folder: str | Path,
+    *,
+    vllm_device: str,
+    dtype_name: str,
+) -> tuple[Any, Any, Any, int]:
+    """Load an SFT regression checkpoint and its saved inference contract."""
+    devices = [item.strip() for item in str(vllm_device).split(",") if item.strip()]
+    if len(devices) != 1:
+        raise ValueError("Regression inference currently requires exactly one --vllm_device.")
+    os.environ["CUDA_VISIBLE_DEVICES"] = devices[0]
+    os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+
+    import torch
+
+    try:
+        dtype = getattr(torch, dtype_name)
+    except AttributeError as error:
+        raise ValueError(f"Unsupported torch dtype for regression inference: {dtype_name}") from error
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    if device.type == "cpu" and dtype == torch.bfloat16:
+        dtype = torch.float32
+
+    try:
+        from .training_sft_on_cc import load_regression_checkpoint
+    except ImportError:
+        from training_sft_on_cc import load_regression_checkpoint
+
+    checkpoint_path = Path(checkpoint_folder)
+    config = json.loads((checkpoint_path / REGRESSION_CONFIG_FILENAME).read_text())
+    model, tokenizer = load_regression_checkpoint(
+        checkpoint_path,
+        device=device,
+        dtype=dtype,
+    )
+    saved_max_length = int(
+        config.get("training_args", {}).get("sequence_max_tokens", 1024)
+    )
+    model.eval()
+    return model, tokenizer, device, saved_max_length
+
+
+def predict_with_regression(
+    model: Any,
+    tokenizer: Any,
+    prompts: Sequence[str],
+    *,
+    batch_size: int,
+    max_length: int,
+    device: Any,
+) -> list[float]:
+    if batch_size <= 0:
+        raise ValueError("--regression_batch_size must be positive.")
+    if max_length <= 0:
+        raise ValueError("--sequence_max_tokens must be positive.")
+
+    import torch
+    from tqdm import tqdm
+
+    predictions: list[float] = []
+    with torch.inference_mode():
+        for start in tqdm(
+            range(0, len(prompts), batch_size),
+            desc="Regression batches",
+            unit="batch",
+        ):
+            batch_prompts = prompts[start : start + batch_size]
+            encoded = tokenizer(
+                list(batch_prompts),
+                padding=True,
+                truncation=True,
+                max_length=max_length,
+                return_tensors="pt",
+            )
+            inputs = {
+                "input_ids": encoded["input_ids"].to(device),
+                "attention_mask": encoded["attention_mask"].to(device),
+            }
+            batch_predictions = model(**inputs)
+            predictions.extend(batch_predictions.float().cpu().tolist())
+    return predictions
+
+
+def materialize_regression_predictions(
+    rows: Sequence[Mapping[str, Any]],
+    prompts: Sequence[str],
+    predictions: Sequence[float],
+) -> tuple[list[dict[str, Any]], list[float], list[float]]:
+    if not (len(rows) == len(prompts) == len(predictions)):
+        raise ValueError("Rows, prompts, and predictions must have the same length.")
+    records = []
+    targets = []
+    resolved_predictions = []
+    for row, prompt, prediction_value in zip(rows, prompts, predictions):
+        target = _row_target(row)
+        prediction = float(prediction_value)
+        records.append(
+            {
+                "example_id": row.get("example_id"),
+                "source_line": row.get("_source_line"),
+                "query": row.get("query"),
+                "expected_accuracy": target,
+                "prompt": prompt,
+                "prediction_for_metrics": prediction,
+            }
+        )
+        resolved_predictions.append(prediction)
+        targets.append(target)
+    return records, resolved_predictions, targets
+
+
 def write_jsonl(path: Path, records: Sequence[Mapping[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w") as file:
@@ -580,34 +737,60 @@ def main() -> None:
     traces_paths = build_output_paths(dataset_paths, traces_filename)
     prompt_template = load_prompt_template(prompt_path)
     print(f"Using prompt template {prompt_path}")
-    prompt_tokenizer = None
-    if args.use_chat_template:
-        from transformers import AutoTokenizer
-
-        prompt_tokenizer = AutoTokenizer.from_pretrained(
-            args.model_folder,
-            trust_remote_code=args.trust_remote_code,
-        )
-        configure_chat_template(
-            prompt_tokenizer,
-            use_chat_template=True,
-            chat_template_path=args.chat_template_path,
-        )
-        template_description = args.chat_template_path or "saved with the model"
-        print(f"Rendering prompts with chat template {template_description}")
+    inference_mode = resolve_inference_mode(args.model_folder, args.inference_mode)
+    print(f"Selected {inference_mode} inference")
     original_model_folder = args.model_folder
     merged_model_dir = None
     try:
-        args.model_folder, merged_model_dir = prepare_model_for_vllm(
-            args.model_folder,
-            dtype=args.dtype,
-            trust_remote_code=args.trust_remote_code,
-        )
-        print(
-            f"Using model {original_model_folder} on "
-            f"CUDA_VISIBLE_DEVICES={args.vllm_device}"
-        )
-        llm, sampling_params = initialize_vllm(args)
+        prompt_tokenizer = None
+        regression_model = None
+        regression_device = None
+        regression_max_length = None
+        llm = None
+        sampling_params = None
+        if inference_mode == "regression":
+            (
+                regression_model,
+                prompt_tokenizer,
+                regression_device,
+                saved_max_length,
+            ) = initialize_regression_model(
+                args.model_folder,
+                vllm_device=args.vllm_device,
+                dtype_name=args.dtype,
+            )
+            regression_max_length = args.sequence_max_tokens or saved_max_length
+            print(
+                f"Using regression checkpoint {original_model_folder} on "
+                f"{regression_device} with max input length {regression_max_length}"
+            )
+        else:
+            if args.use_chat_template:
+                from transformers import AutoTokenizer
+
+                prompt_tokenizer = AutoTokenizer.from_pretrained(
+                    args.model_folder,
+                    trust_remote_code=args.trust_remote_code,
+                )
+            args.model_folder, merged_model_dir = prepare_model_for_vllm(
+                args.model_folder,
+                dtype=args.dtype,
+                trust_remote_code=args.trust_remote_code,
+            )
+            print(
+                f"Using model {original_model_folder} on "
+                f"CUDA_VISIBLE_DEVICES={args.vllm_device}"
+            )
+            llm, sampling_params = initialize_vllm(args)
+
+        if args.use_chat_template:
+            configure_chat_template(
+                prompt_tokenizer,
+                use_chat_template=True,
+                chat_template_path=args.chat_template_path,
+            )
+            template_description = args.chat_template_path or "saved with the model"
+            print(f"Rendering prompts with chat template {template_description}")
 
         for dataset_index, (dataset_path, metrics_path, traces_path) in enumerate(
             zip(dataset_paths, metrics_paths, traces_paths),
@@ -627,14 +810,30 @@ def main() -> None:
                 use_chat_template=args.use_chat_template,
             )
             print(f"[{dataset_index}/{len(dataset_paths)}] Loaded {len(rows)} examples from {dataset_path}")
-            responses = generate_with_vllm(llm, sampling_params, prompts)
-            records, predictions, targets, invalid_count = materialize_predictions(
-                rows,
-                prompts,
-                responses,
-                args.invalid_policy,
-                args.confidence_output_format,
-            )
+            if inference_mode == "regression":
+                raw_predictions = predict_with_regression(
+                    regression_model,
+                    prompt_tokenizer,
+                    prompts,
+                    batch_size=args.regression_batch_size,
+                    max_length=regression_max_length,
+                    device=regression_device,
+                )
+                records, predictions, targets = materialize_regression_predictions(
+                    rows,
+                    prompts,
+                    raw_predictions,
+                )
+                invalid_count = 0
+            else:
+                responses = generate_with_vllm(llm, sampling_params, prompts)
+                records, predictions, targets, invalid_count = materialize_predictions(
+                    rows,
+                    prompts,
+                    responses,
+                    args.invalid_policy,
+                    args.confidence_output_format,
+                )
             metrics = compute_metrics(predictions, targets)
             metrics.update(
                 {

@@ -35,11 +35,12 @@ except ImportError:  # Support direct execution from cs336_alignment/.
 REGRESSION_CONFIG_FILENAME = "regression_config.json"
 REGRESSION_HEAD_FILENAME = "regression_head.pt"
 BACKBONE_DIRECTORY = "backbone"
-OptimizationMode = Literal["sigmoid_mse", "linear_mse", "bce_with_logits"]
+OptimizationMode = Literal["sigmoid_mse", "linear_mse", "bce_with_logits", "ranknet_logistic_loss"]
 OPTIMIZATION_MODES: tuple[OptimizationMode, ...] = (
     "sigmoid_mse",
     "linear_mse",
     "bce_with_logits",
+    "ranknet_logistic_loss"
 )
 
 
@@ -120,6 +121,8 @@ class RegressionWithLLMBackbone(nn.Module):
         targets: torch.Tensor,
         *,
         reduction: Literal["mean", "sum"] = "mean",
+        ranknet_logistic_loss_temperature: float = 1.0,
+        ranknet_tie_loss_weight: float = 0.0,
     ) -> torch.Tensor:
         if self.optimization_mode == "sigmoid_mse":
             return F.mse_loss(
@@ -127,6 +130,45 @@ class RegressionWithLLMBackbone(nn.Module):
             )
         if self.optimization_mode == "linear_mse":
             return F.mse_loss(scores, targets, reduction=reduction)
+        if self.optimization_mode == "ranknet_logistic_loss":
+            if ranknet_logistic_loss_temperature <= 0.0:
+                raise ValueError("RankNet temperature must be positive.")
+            if ranknet_tie_loss_weight < 0.0:
+                raise ValueError("RankNet tie loss weight must be non-negative.")
+
+            score_differences = scores[:, None] - scores[None, :]
+            target_differences = targets[:, None] - targets[None, :]
+            upper_triangle = torch.triu(
+                torch.ones_like(target_differences, dtype=torch.bool),
+                diagonal=1,
+            )
+            comparable_pairs = upper_triangle & target_differences.ne(0)
+
+            loss = scores.sum() * 0.0
+            if torch.any(comparable_pairs):
+                directions = torch.sign(target_differences[comparable_pairs])
+                signed_margins = (
+                    directions * score_differences[comparable_pairs]
+                    / ranknet_logistic_loss_temperature
+                )
+                pair_losses = F.softplus(-signed_margins)
+                loss = pair_losses.sum() if reduction == "sum" else pair_losses.mean()
+
+            tied_pairs = upper_triangle & target_differences.eq(0)
+            if ranknet_tie_loss_weight > 0.0 and torch.any(tied_pairs):
+                tie_margins = (
+                    score_differences[tied_pairs]
+                    / ranknet_logistic_loss_temperature
+                )
+                # A neutral (0.5) preference has its minimum at equal scores. Subtract
+                # log(2) so the auxiliary loss is zero at that minimum.
+                tie_losses = (
+                    0.5 * (F.softplus(-tie_margins) + F.softplus(tie_margins))
+                    - math.log(2.0)
+                )
+                tie_loss = tie_losses.sum() if reduction == "sum" else tie_losses.mean()
+                loss = loss + ranknet_tie_loss_weight * tie_loss
+            return loss
         return F.binary_cross_entropy_with_logits(
             scores, targets, reduction=reduction
         )
@@ -202,6 +244,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--ranknet_logistic_loss_temperature",
+        type=float,
+        default=1.0,
+        help="Controls the sharpness of the RankNet logistic loss.",
+    )
+    parser.add_argument(
+        "--ranknet-tie-loss-weight",
+        type=float,
+        default=0.0,
+        help="Weight on neutral-preference loss for pairs with equal targets.",
+    )
+    parser.add_argument(
         "--train-batch-size",
         type=int,
         default=32,
@@ -232,6 +286,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Save a separate final checkpoint in addition to the best-Spearman one.",
+    )
+    parser.add_argument(
+        "--save-best-checkpoint",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Write the model whenever validation reaches a new best Spearman score. "
+            "Disable during hyperparameter search to avoid repeated full-model writes; "
+            "best metrics are still tracked."
+        ),
     )
     parser.add_argument(
         "--dtype",
@@ -309,6 +373,22 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError(f"{name} must be positive.")
     if args.max_grad_norm <= 0.0:
         raise ValueError("--max-grad-norm must be positive.")
+    if (
+        not math.isfinite(args.ranknet_logistic_loss_temperature)
+        or args.ranknet_logistic_loss_temperature <= 0.0
+    ):
+        raise ValueError("--ranknet_logistic_loss_temperature must be finite and positive.")
+    if not math.isfinite(args.ranknet_tie_loss_weight) or args.ranknet_tie_loss_weight < 0.0:
+        raise ValueError("--ranknet-tie-loss-weight must be finite and non-negative.")
+    if (
+        args.optimization_mode == "ranknet_logistic_loss"
+        and args.gradient_accumulation_steps != 1
+    ):
+        raise ValueError(
+            "--gradient-accumulation-steps must be 1 when "
+            "--optimization-mode=ranknet_logistic_loss so all pairs are computed "
+            "within the full training batch."
+        )
     if args.gradient_accumulation_steps > args.train_batch_size:
         raise ValueError("--gradient-accumulation-steps cannot exceed --train-batch-size.")
     if args.train_batch_size % args.gradient_accumulation_steps != 0:
@@ -469,6 +549,8 @@ def regression_train_step(
     max_length: int,
     max_grad_norm: float,
     device: torch.device,
+    ranknet_logistic_loss_temperature: float = 1.0,
+    ranknet_tie_loss_weight: float = 0.0,
 ) -> tuple[float, dict[str, float]]:
     """Run one update equivalent to evaluating the selected loss on the full batch."""
     if not rows:
@@ -490,9 +572,28 @@ def regression_train_step(
         max_sequence_length = max(max_sequence_length, inputs["input_ids"].shape[1])
         scores = model.forward_scores(**inputs)
         predictions = model.scores_to_predictions(scores)
-        microbatch_loss_sum = model.compute_loss(scores, targets, reduction="sum")
-        (microbatch_loss_sum / batch_size).backward()
-        summed_loss += microbatch_loss_sum.detach()
+        if model.optimization_mode == "ranknet_logistic_loss":
+            # RankNet uses one microbatch containing the full training batch,
+            # so normalize directly over comparable pairs.
+            microbatch_loss = model.compute_loss(
+                scores,
+                targets,
+                reduction="mean",
+                ranknet_logistic_loss_temperature=(
+                    ranknet_logistic_loss_temperature
+                ),
+                ranknet_tie_loss_weight=ranknet_tie_loss_weight,
+            )
+            microbatch_loss.backward()
+            summed_loss += microbatch_loss.detach() * batch_size
+        else:
+            microbatch_loss_sum = model.compute_loss(
+                scores,
+                targets,
+                reduction="sum",
+            )
+            (microbatch_loss_sum / batch_size).backward()
+            summed_loss += microbatch_loss_sum.detach()
         prediction_sum += predictions.detach().sum()
 
     gradient_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
@@ -804,19 +905,20 @@ def main(argv: Sequence[str] | None = None) -> None:
             best_mse = mse
             best_step = step
             print(f"New best validation Spearman correlation: {spearman:.4f}")
-            save_regression_checkpoint(
-                f"{checkpoint_prefix}-best-spearman",
-                model,
-                tokenizer,
-                model_id=args.model_id,
-                use_peft=args.use_peft,
-                training_args=training_args,
-                validation_metrics={
-                    "valid/step": best_step,
-                    "valid/spearman_r": best_spearman,
-                    "valid/mse": best_mse,
-                },
-            )
+            if args.save_best_checkpoint:
+                save_regression_checkpoint(
+                    f"{checkpoint_prefix}-best-spearman",
+                    model,
+                    tokenizer,
+                    model_id=args.model_id,
+                    use_peft=args.use_peft,
+                    training_args=training_args,
+                    validation_metrics={
+                        "valid/step": best_step,
+                        "valid/spearman_r": best_spearman,
+                        "valid/mse": best_mse,
+                    },
+                )
         validation_log = _wandb_validation_metrics(metrics)
         if best_step is not None:
             validation_log.update(
@@ -863,6 +965,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                         max_length=args.sequence_max_tokens,
                         max_grad_norm=args.max_grad_norm,
                         device=device,
+                        ranknet_logistic_loss_temperature=args.ranknet_logistic_loss_temperature,
+                        ranknet_tie_loss_weight=args.ranknet_tie_loss_weight,
                     )
                 progress.set_postfix(loss=f"{loss:.5f}")
                 wandb_run.log(
