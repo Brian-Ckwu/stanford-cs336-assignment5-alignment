@@ -156,7 +156,7 @@ full_dataset = list()
 with open("../data/gsm8k/train.jsonl") as f:
     for line in f:
         row = json.loads(line)
-        row["prompt"] = prompt_template.format(question=row["question"])
+        row["prompt"] = prompt_template.replace("{question}", row["question"])
         row["answer"] = row["answer"].split("####")[-1].strip()
         full_dataset.append(row)
 random.shuffle(full_dataset)
