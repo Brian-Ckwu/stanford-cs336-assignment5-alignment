@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import signal
+import socket
 import subprocess
 import time
 import urllib.request
@@ -30,7 +31,7 @@ class VLLMCompletion:
 class VLLMServer:
     model_id: str
     host: str = "127.0.0.1"
-    port: int = 8000
+    port: int | None = None
     gpu: int = 1
     seed: int = 0
     load_format: str = "auto"
@@ -46,6 +47,8 @@ class VLLMServer:
     shutdown_timeout: int = 30
 
     def __post_init__(self) -> None:
+        if self.port is None:
+            self.port = find_available_port(self.host)
         self.base_url = f"http://{self.host}:{self.port}"
         self.process = None
         self.weight_sync_group = None
@@ -53,7 +56,6 @@ class VLLMServer:
 
     def start(self) -> None:
         if self.launch_server:
-            kill_existing_vllm_server(self.port)
             self.process = start_server(
                 model_id=self.model_id,
                 host=self.host,
@@ -147,6 +149,12 @@ def _http_json(method: str, url: str, payload: dict | None = None, timeout: int 
         # plain-text confirmation rather than JSON.
         return {"message": body.decode("utf-8", errors="replace")}
     return parsed if isinstance(parsed, dict) else {"result": parsed}
+
+
+def find_available_port(host: str = "127.0.0.1") -> int:
+    with socket.socket() as sock:
+        sock.bind((host, 0))
+        return sock.getsockname()[1]
 
 
 def kill_existing_vllm_server(port: int) -> None:
