@@ -20,6 +20,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=1e-5)
     parser.add_argument("--rollout-batch-size", type=int, default=256)
     parser.add_argument("--train-batch-size", type=int, default=256)
+    parser.add_argument("--valid-batch-size", type=int, default=1024)
     parser.add_argument("--group-size", type=int, default=8)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=32)
     parser.add_argument("--sampling-temperature", type=float, default=1.0)
@@ -125,6 +126,8 @@ sampling_params = {
     "stop": args.sampling_stop,
     "include_stop_str_in_output": args.include_stop_str_in_output,
 }
+validation_sampling_params = sampling_params.copy()
+validation_sampling_params.update({"n": 1})  # only need one rollout per instance for validation
 
 import os
 from dotenv import load_dotenv
@@ -239,6 +242,19 @@ print(f"Rollout batch size: {rollout_batch_size}; # Questions per rollout: {n_qu
 
 from tqdm import tqdm
 
+# Validation before training
+from evaluation import evaluate
+validation_metrics = evaluate(
+    vllm_server=llm_rollout,
+    eval_dataset=valid_dataset,
+    sampling_params=validation_sampling_params,
+    batch_size=args.valid_batch_size,
+    reward_fn=r1_zero_reward_fn,
+)
+wandb_run.log(data={
+    **{f"valid/{key}": value for key, value in validation_metrics.items()}
+}, step=0)
+
 for i in tqdm(range(num_rollout_steps), desc="GRPO training steps"):
     time_metrics = {}
     train_rows = train_dataset[i*n_questions_per_rollout:(i+1)*n_questions_per_rollout]
@@ -328,7 +344,18 @@ for i in tqdm(range(num_rollout_steps), desc="GRPO training steps"):
         **memory_metrics,
         **time_metrics,
     }, step=i)
-    # TODO: validation
+    # Validation
+    if ((i + 1) % 10 == 0) or (i == num_rollout_steps - 1):
+        validation_metrics = evaluate(
+            vllm_server=llm_rollout,
+            eval_dataset=valid_dataset,
+            sampling_params=validation_sampling_params,
+            batch_size=args.valid_batch_size,
+            reward_fn=r1_zero_reward_fn,
+        )
+        wandb_run.log(data={
+            **{f"valid/{key}": value for key, value in validation_metrics.items()}
+        }, step=i)
 
 # Closing
 llm_rollout.stop()
