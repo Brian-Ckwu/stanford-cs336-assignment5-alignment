@@ -22,6 +22,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rollout-batch-size", type=int, default=256)
     parser.add_argument("--train-batch-size", type=int, default=256)
     parser.add_argument("--valid-batch-size", type=int, default=1024)
+    parser.add_argument(
+        "--validation-n",
+        type=int,
+        default=1,
+        help="Number of sampled completions per validation prompt.",
+    )
     parser.add_argument("--group-size", type=int, default=8)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=32)
     parser.add_argument("--sampling-temperature", type=float, default=1.0)
@@ -128,7 +134,9 @@ sampling_params = {
     "include_stop_str_in_output": args.include_stop_str_in_output,
 }
 validation_sampling_params = sampling_params.copy()
-validation_sampling_params.update({"n": 1})  # only need one rollout per instance for validation
+if args.validation_n <= 0:
+    raise ValueError("--validation-n must be positive.")
+validation_sampling_params.update({"n": args.validation_n})
 
 import os
 from dotenv import load_dotenv
@@ -251,6 +259,8 @@ validation_metrics = evaluate(
     sampling_params=validation_sampling_params,
     batch_size=args.valid_batch_size,
     reward_fn=r1_zero_reward_fn,
+    tokenizer=tokenizer if args.add_cc_sft_loss else None,
+    cc_group_size=group_size if args.add_cc_sft_loss else None,
 )
 wandb_run.log(data={
     **{f"valid/{key}": value for key, value in validation_metrics.items()}
@@ -355,6 +365,8 @@ for i in tqdm(range(num_rollout_steps), desc="GRPO training steps"):
             sampling_params=validation_sampling_params,
             batch_size=args.valid_batch_size,
             reward_fn=r1_zero_reward_fn,
+            tokenizer=tokenizer if args.add_cc_sft_loss else None,
+            cc_group_size=group_size if args.add_cc_sft_loss else None,
         )
         wandb_run.log(data={
             **{f"valid/{key}": value for key, value in validation_metrics.items()}
