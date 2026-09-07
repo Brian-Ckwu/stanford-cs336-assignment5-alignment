@@ -3,6 +3,7 @@ import time
 from typing import Callable, Iterator, Literal
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 from transformers import PreTrainedTokenizerBase
 
@@ -142,6 +143,8 @@ def get_response_log_probs(
     input_ids: torch.Tensor,
     labels: torch.Tensor,
     return_token_entropy: bool,
+    return_first_response_token_log_probs: bool = False,
+    response_mask: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """Get per-token conditional log-probabilities (given the previous tokens)
     from a causal language model, and optionally the entropy of the model's
@@ -159,7 +162,12 @@ def get_response_log_probs(
             tokenization method.
         return_token_entropy: bool
             If True, also return per-token entropy.
-
+        return_first_response_token_log_probs: bool
+            If True, also return the full-vocabulary log-probability
+            distribution used to predict the first response token.
+        response_mask: torch.Tensor | None
+            Shape (batch_size, sequence_length), aligned with labels. Required
+            when return_first_response_token_log_probs is True.
     Returns:
         dict[str, torch.Tensor].
             "log_probs"
@@ -169,6 +177,8 @@ def get_response_log_probs(
                 optional, shape (batch_size, sequence_length), per-token
                 entropy for each position (present only if
                 return_token_entropy=True).
+            "first_response_token_log_probs"
+                optional, shape (batch_size, vocab_size)
     """
     outputs = dict()
     logits = model(input_ids).logits
@@ -179,6 +189,23 @@ def get_response_log_probs(
     outputs["log_probs"] = label_log_probs
     if return_token_entropy:
         outputs["token_entropy"] = -(all_log_probs.exp() * all_log_probs).sum(-1)
+    if return_first_response_token_log_probs:
+        if response_mask is None:
+            raise ValueError("response_mask shouldn't be None when return_first_response_token_log_probs is True")
+        if response_mask.shape != labels.shape:
+            raise ValueError(
+                f"response_mask shape ({response_mask.shape}) should match labels shape ({labels.shape})"
+            )
+        response_positions = response_mask.to(dtype=torch.bool)
+        if not response_positions.any(dim=-1).all():
+            raise ValueError("Every sequence must contain at least one response token")
+        first_response_token_indices = response_positions.to(dtype=torch.long).argmax(dim=-1)
+        batch_indices = torch.arange(input_ids.shape[0], device=all_log_probs.device)
+        outputs["first_response_token_log_probs"] = all_log_probs[
+            batch_indices,
+            first_response_token_indices.to(all_log_probs.device),
+        ]
+
     # ===== End of Implementation 1 =====
     # # ===== Implementation 2: originally done for better memory efficiency, but it turns out slower empirically (might be due to optimized kernel used in Implmenetation 1) =====
     #     # NOTE: logits must be normalized with before they become log-probs.
@@ -360,6 +387,43 @@ def compute_policy_gradient_loss(
     return per_token_policy_gradient_loss, metadata
 
 
+def compute_cc_sft_loss(
+    first_response_token_log_probs: torch.Tensor,  # of shape (batch_size, vocabulary_size) # NOTE: currently the confidence token position is hard-coded as position one
+    raw_rewards: torch.Tensor,  # of shape (batch_size,)
+    group_size: int,  # batch_size should be divided by group_size without remainder
+    tokenizer: PreTrainedTokenizerBase,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    if first_response_token_log_probs.shape[0] != raw_rewards.shape[0]:
+        raise ValueError(f"Shape of policy_log_probs ({first_response_token_log_probs.shape}) should be aligned with raw_rewards ({raw_rewards.shape})")
+    if not (raw_rewards.shape[0] / group_size).is_integer():
+        raise ValueError(f"Length of raw_rewards ({raw_rewards.shape[0]}) must be divided by group_size ({group_size})")
+    num_groups = raw_rewards.shape[0] // group_size
+    loss_metadata = dict()
+    gt_tokens = torch.empty(size=(raw_rewards.shape[0],), dtype=torch.long, device=first_response_token_log_probs.device)
+    for i in range(num_groups):
+        # Get the sum of rewards (i.e., number of correct attempts) from the group
+        n_correct = raw_rewards[i*group_size:(i+1)*group_size].sum().item()
+        if (not n_correct.is_integer()) or not (0 <= n_correct <= 9):
+            raise ValueError(f"Currently only support integer n_correct in [0, 9], but got ({n_correct})")
+        # Get the token_id of the ground truth, which is the number of correct attempts
+        gt_token_ids = tokenizer.encode(str(int(n_correct)), add_special_tokens=False)
+        if len(gt_token_ids) != 1:
+            raise ValueError(
+                f"Expected the confidence count {int(n_correct)} to encode to one token, got {gt_token_ids}"
+            )
+        gt_token_id = gt_token_ids[0]
+        gt_tokens[i*group_size:(i+1)*group_size] = gt_token_id
+    # Compute cross entropy loss
+    loss = F.cross_entropy(
+        input=first_response_token_log_probs,
+        target=gt_tokens,
+        reduction="sum",
+    )
+    # TODO: print out token_ids of the top-5 highest probability first token log probs for each example and gt_tokens for debugging
+    loss /= raw_rewards.shape[0]
+    return loss, loss_metadata
+
+
 def aggregate_loss_across_microbatch(
     per_token_policy_gradient_loss: torch.Tensor,
     mask: torch.Tensor,
@@ -421,6 +485,8 @@ def grpo_train_step(
     normalization_constant: int | None = None,
     track_policy_memory: bool = False,
     track_step_time: bool = False,
+    add_cc_sft_loss: bool = False,
+    cc_sft_loss_lambda: float = 1.0,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor | float]]:
     """Execute forward-and-backward passes, with gradient_accumulation_steps
     microbatches.
@@ -505,6 +571,8 @@ def grpo_train_step(
     memory_metrics: dict[str, float] = {}
     # Gradient accumulation across microbatches
     loss = torch.tensor(0.0)
+    grpo_loss_total = torch.tensor(0.0)
+    cc_sft_loss_total = torch.tensor(0.0)
     avg_entropy = torch.tensor(0.0)  # TODO: check why this information might be useful and whether my implementation is reasonable
     for i in range(gradient_accumulation_steps):
         # Get the data related to this microbatch
@@ -539,7 +607,9 @@ def grpo_train_step(
                 model,
                 input_ids=tokenized["input_ids"].to(model_device),
                 labels=tokenized["labels"].to(model_device),  # Remember to move the tokenized data to the same device as the model
-                return_token_entropy=True
+                return_token_entropy=True,
+                return_first_response_token_log_probs=add_cc_sft_loss,
+                response_mask=tokenized["response_mask"].to(model_device) if add_cc_sft_loss else None,
             )
         avg_entropy += response_token_logprobs["token_entropy"].mean().detach().cpu() * (len(prompts) / batch_size)
         # Compute policy-gradient loss
@@ -560,12 +630,24 @@ def grpo_train_step(
                 cliprange=cliprange,
                 response_mask=tokenized["response_mask"].to(model_device)
             )
-            microbatch_loss = aggregate_loss_across_microbatch(
+            scaled_grpo_loss = aggregate_loss_across_microbatch(
                 per_token_policy_gradient_loss=per_token_loss,
                 mask=tokenized["response_mask"].to(model_device),
                 loss_normalization=loss_normalization,
                 normalization_constant=normalization_constant
             ) * (per_token_loss.shape[0] / batch_size)  # NOTE: Important!!! Remember to rescale the loss to make the accumulated loss equivalent to the full-batch loss
+            grpo_loss_total += scaled_grpo_loss.detach().cpu()
+            microbatch_loss = scaled_grpo_loss
+            if add_cc_sft_loss:
+                cc_sft_loss, cc_sft_loss_metadata = compute_cc_sft_loss(
+                    first_response_token_log_probs=response_token_logprobs["first_response_token_log_probs"],
+                    raw_rewards=raw_rewards[i*microbatch_size:(i+1)*microbatch_size],
+                    group_size=group_size,
+                    tokenizer=tokenizer,
+                )
+                scaled_cc_sft_loss = cc_sft_loss * (per_token_loss.shape[0] / batch_size)
+                cc_sft_loss_total += scaled_cc_sft_loss.detach().cpu()
+                microbatch_loss = scaled_grpo_loss + cc_sft_loss_lambda * scaled_cc_sft_loss
         with track_cuda_memory_and_time(
             "backward",
             device=model_device,
@@ -609,6 +691,8 @@ def grpo_train_step(
     ):
         optimizer.zero_grad(set_to_none=True)
     metadata={
+        "grpo_loss": grpo_loss_total,
+        "cc_sft_loss": cc_sft_loss_total,
         "gradient_norm": total_norm,
         "token_entropy": avg_entropy,
         "mean_total_reward": raw_rewards_metadata["mean_total_reward"],

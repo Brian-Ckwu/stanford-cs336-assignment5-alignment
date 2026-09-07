@@ -13,7 +13,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rollout-device", type=int, default=3)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument("--prompt-path", default="prompts/r1_zero.prompt")
-
+    parser.add_argument("--add-cc-sft-loss", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--cc-sft-loss-lambda", type=float, default=1.0)
     parser.add_argument("--n-train-examples", type=int, default=6400)
     parser.add_argument("--n-val-examples", type=int, default=1024)
     parser.add_argument("--num-rollout-steps", type=int, default=200)
@@ -159,7 +160,7 @@ full_dataset = list()
 with open("../data/gsm8k/train.jsonl") as f:
     for line in f:
         row = json.loads(line)
-        row["prompt"] = prompt_template.replace("{question}", row["question"])
+        row["prompt"] = prompt_template.replace("{question}", row["question"]).replace("{group_size}", str(group_size))  # NOTE: group_size in the prompt is meant for the cc loss
         row["answer"] = row["answer"].split("####")[-1].strip()
         full_dataset.append(row)
 random.shuffle(full_dataset)
@@ -309,6 +310,8 @@ for i in tqdm(range(num_rollout_steps), desc="GRPO training steps"):
             group_size=group_size,
             track_policy_memory=track_policy_memory,
             track_step_time=track_step_time,
+            add_cc_sft_loss=args.add_cc_sft_loss,
+            cc_sft_loss_lambda=args.cc_sft_loss_lambda,
         )
     # Sync weights
     print("Syncing weights of the rollout LLM to be the same with the updated policy LLM...")
