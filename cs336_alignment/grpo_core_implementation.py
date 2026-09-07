@@ -138,6 +138,22 @@ def tokenize_prompt_and_output(
     }
 
 
+def remove_first_response_token_from_mask(response_mask: torch.Tensor) -> torch.Tensor:
+    """Return a copy of a response mask with each sequence's first response token excluded."""
+    if response_mask.ndim != 2:
+        raise ValueError(f"response_mask must be 2D, got shape {response_mask.shape}")
+    response_positions = response_mask.to(dtype=torch.bool)
+    if not response_positions.any(dim=-1).all():
+        raise ValueError("Every sequence must contain at least one response token")
+    first_response_token_indices = response_positions.to(dtype=torch.long).argmax(dim=-1)
+    grpo_response_mask = response_mask.clone()
+    grpo_response_mask[
+        torch.arange(response_mask.shape[0], device=response_mask.device),
+        first_response_token_indices,
+    ] = 0
+    return grpo_response_mask
+
+
 def get_response_log_probs(
     model: torch.nn.Module,
     input_ids: torch.Tensor,
@@ -418,7 +434,7 @@ def compute_cc_sft_loss(
         input=first_response_token_log_probs,
         target=gt_tokens,
         reduction="sum",
-    )
+    ) / group_size  # normalize by group_size to avoid inflating the loss by group_size times, since the group_size rollouts are from the same prompt
     # TODO: print out token_ids of the top-5 highest probability first token log probs for each example and gt_tokens for debugging
     loss /= raw_rewards.shape[0]
     return loss, loss_metadata
@@ -457,7 +473,10 @@ def aggregate_loss_across_microbatch(
     masked_loss = mask * per_token_policy_gradient_loss  # shape = (batch_size, sequence_length)
     match loss_normalization:
         case "sequence":
-            normalized_loss_of_each_sequence = masked_loss.sum(dim=-1) / mask.sum(dim=-1)
+            included_token_counts = mask.sum(dim=-1)
+            normalized_loss_of_each_sequence = (
+                masked_loss.sum(dim=-1) / included_token_counts.clamp_min(1)
+            )
             avg_loss = normalized_loss_of_each_sequence.sum() / masked_loss.shape[0]  # NOTE: remember to normalize by batch_size (i.e., B * G)
         case "constant":
             raise NotImplementedError
@@ -588,6 +607,12 @@ def grpo_train_step(
             track_time=track_step_time,
         ):
             tokenized = tokenize_prompt_and_output(prompts, responses, tokenizer)  # a dict with keys "input_ids", "labels", and "response_mask"
+        response_mask = tokenized["response_mask"].to(model_device)
+        grpo_response_mask = (
+            remove_first_response_token_from_mask(response_mask)
+            if add_cc_sft_loss
+            else response_mask
+        )
         if track_policy_memory:
             memory_metrics["policy_memory/max_sequence_length"] = max(
                 memory_metrics.get("policy_memory/max_sequence_length", 0),
@@ -609,7 +634,7 @@ def grpo_train_step(
                 labels=tokenized["labels"].to(model_device),  # Remember to move the tokenized data to the same device as the model
                 return_token_entropy=True,
                 return_first_response_token_log_probs=add_cc_sft_loss,
-                response_mask=tokenized["response_mask"].to(model_device) if add_cc_sft_loss else None,
+                response_mask=response_mask if add_cc_sft_loss else None,
             )
         avg_entropy += response_token_logprobs["token_entropy"].mean().detach().cpu() * (len(prompts) / batch_size)
         # Compute policy-gradient loss
@@ -628,11 +653,11 @@ def grpo_train_step(
                 importance_reweighting_method=importance_reweighting_method,
                 old_log_probs=microbatch_old_log_probs.to(model_device) if microbatch_old_log_probs else None,
                 cliprange=cliprange,
-                response_mask=tokenized["response_mask"].to(model_device)
+                response_mask=grpo_response_mask,
             )
             scaled_grpo_loss = aggregate_loss_across_microbatch(
                 per_token_policy_gradient_loss=per_token_loss,
-                mask=tokenized["response_mask"].to(model_device),
+                mask=grpo_response_mask,
                 loss_normalization=loss_normalization,
                 normalization_constant=normalization_constant
             ) * (per_token_loss.shape[0] / batch_size)  # NOTE: Important!!! Remember to rescale the loss to make the accumulated loss equivalent to the full-batch loss
