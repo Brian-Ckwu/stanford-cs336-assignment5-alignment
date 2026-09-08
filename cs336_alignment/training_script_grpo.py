@@ -88,6 +88,15 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="Use fp32 LoRA weights; pass --no-autocast-adapter-dtype for bf16.",
     )
+    parser.add_argument(
+        "--save-only-adapter",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Save only the trained PEFT adapter in the final checkpoint instead "
+            "of merging it into the base model. Requires --use-peft."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -124,6 +133,9 @@ lora_dropout = args.lora_dropout
 lora_adapter_name = args.lora_adapter_name
 lora_target_modules = args.lora_target_modules
 autocast_adapter_dtype = args.autocast_adapter_dtype
+
+if args.save_only_adapter and not use_peft:
+    raise ValueError("--save-only-adapter requires --use-peft")
 
 sampling_params = {
     "temperature": sampling_temperature,
@@ -379,8 +391,10 @@ if runtime_adapter_dir is not None:
 
 output_dir = f"checkpoints/{wandb_exp_name}-final"
 tokenizer.save_pretrained(output_dir)
-if use_peft:  # NOTE: currently save the full merged model instead of the adapter only
-    merged = llm_policy.merge_and_unload()  # XXX: understand this
+if use_peft and args.save_only_adapter:
+    llm_policy.save_pretrained(output_dir, safe_serialization=True)
+elif use_peft:
+    merged = llm_policy.merge_and_unload()
     merged.save_pretrained(output_dir, safe_serialization=True)
 else:
     llm_policy.save_pretrained(output_dir, safe_serialization=True)
