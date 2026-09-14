@@ -42,11 +42,14 @@ class VLLMServer:
     max_lora_rank: int = 16
     max_loras: int = 1
     max_model_len: int = 1024
+    max_num_seqs: int = 256
     launch_server: bool = True
     startup_timeout: int = 600
     shutdown_timeout: int = 30
 
     def __post_init__(self) -> None:
+        if self.max_num_seqs <= 0:
+            raise ValueError("max_num_seqs must be positive")
         if self.port is None:
             self.port = find_available_port(self.host)
         self.base_url = f"http://{self.host}:{self.port}"
@@ -69,7 +72,8 @@ class VLLMServer:
                 enable_lora=self.enable_lora,
                 max_lora_rank=self.max_lora_rank,
                 max_loras=self.max_loras,
-                max_model_len=self.max_model_len
+                max_model_len=self.max_model_len,
+                max_num_seqs=self.max_num_seqs,
             )
             atexit.register(self.stop)
         wait_for_server(self.base_url, self.process, self.startup_timeout)
@@ -181,7 +185,8 @@ def start_server(
     enable_lora: bool = False,
     max_lora_rank: int = 16,
     max_loras: int = 1,
-    max_model_len: int = 1024
+    max_model_len: int = 1024,
+    max_num_seqs: int = 256,
 ) -> subprocess.Popen:
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = str(gpu)
@@ -214,6 +219,8 @@ def start_server(
         load_format,
         "--max_model_len",
         str(max_model_len),
+        "--max-num-seqs",
+        str(max_num_seqs),
     ]
     if enable_lora:
         command.extend(

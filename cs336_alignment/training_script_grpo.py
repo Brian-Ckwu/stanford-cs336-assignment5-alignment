@@ -19,9 +19,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-val-examples", type=int, default=1024)
     parser.add_argument("--num-rollout-steps", type=int, default=200)
     parser.add_argument("--learning-rate", type=float, default=1e-5)
-    parser.add_argument("--rollout-batch-size", type=int, default=256)
+    parser.add_argument("--rollout-max-num-seqs", type=int, default=256)
     parser.add_argument("--train-batch-size", type=int, default=256)
     parser.add_argument("--valid-batch-size", type=int, default=1024)
+    parser.add_argument(
+        "--difficulty-filter",
+        choices=("none", "empirical-reward"),
+        default="none",
+    )
+    parser.add_argument("--difficulty-lower-bound", type=float, default=0.2)
+    parser.add_argument("--difficulty-upper-bound", type=float, default=0.8)
+    parser.add_argument(
+        "--max-candidate-groups-multiplier",
+        type=int,
+        default=10,
+        help=(
+            "Per-step candidate safety limit as a multiple of "
+            "train_batch_size // group_size."
+        ),
+    )
     parser.add_argument(
         "--validation-n",
         type=int,
@@ -113,7 +129,7 @@ n_train_examples = args.n_train_examples
 n_val_examples = args.n_val_examples
 num_rollout_steps = args.num_rollout_steps
 learning_rate = args.learning_rate
-rollout_batch_size = args.rollout_batch_size
+rollout_max_num_seqs = args.rollout_max_num_seqs
 train_batch_size = args.train_batch_size
 group_size = args.group_size
 gradient_accumulation_steps = args.gradient_accumulation_steps
@@ -134,6 +150,16 @@ lora_adapter_name = args.lora_adapter_name
 lora_target_modules = args.lora_target_modules
 autocast_adapter_dtype = args.autocast_adapter_dtype
 
+if rollout_max_num_seqs <= 0:
+    raise ValueError("--rollout-max-num-seqs must be positive")
+if train_batch_size <= 0:
+    raise ValueError("--train-batch-size must be positive")
+if group_size <= 0:
+    raise ValueError("--group-size must be positive")
+if train_batch_size % group_size != 0:
+    raise ValueError("--train-batch-size must be divisible by --group-size")
+if args.max_candidate_groups_multiplier <= 0:
+    raise ValueError("--max-candidate-groups-multiplier must be positive")
 if args.save_only_adapter and not use_peft:
     raise ValueError("--save-only-adapter requires --use-peft")
 
@@ -160,6 +186,13 @@ wandb.login()
 wandb_config = {
     "lr": learning_rate,
     "seed": seed,
+    "difficulty_filter": args.difficulty_filter,
+    "difficulty_lower_bound": args.difficulty_lower_bound,
+    "difficulty_upper_bound": args.difficulty_upper_bound,
+    "rollout_max_num_seqs": rollout_max_num_seqs,
+    "max_candidate_groups_multiplier": (
+        args.max_candidate_groups_multiplier
+    ),
 }
 wandb_run = wandb.init(project=wandb_project_name, name=wandb_exp_name, config=wandb_config)
 
@@ -187,6 +220,11 @@ random.shuffle(full_dataset)
 train_dataset = full_dataset[:n_train_examples]
 valid_dataset = full_dataset[n_train_examples:n_train_examples+n_val_examples]
 
+if len(train_dataset) < train_batch_size // group_size:
+    raise ValueError(
+        "Training dataset must contain at least "
+        f"{train_batch_size // group_size} examples"
+    )
 
 print(f"Train dataset size: {len(train_dataset)}; validation dataset size: {len(valid_dataset)}")
 
@@ -235,6 +273,7 @@ llm_rollout = VLLMServer(
     enable_lora=use_peft,
     max_lora_rank=lora_r,
     max_loras=1,
+    max_num_seqs=rollout_max_num_seqs,
 )
 print(f"Starting the rollout model (vLLM service)...")
 llm_rollout.start()
@@ -254,12 +293,33 @@ else:
 # Training loop
 from grpo_core_implementation import grpo_train_step, track_cuda_memory_and_time
 from drgrpo_grader import r1_zero_reward_fn
+from rollout_batch_collection import EmpiricalRewardRolloutBatchCollector
 
-# NOTE: currently just train for one epoch to avoid overfitting, so I add the following check
-assert num_rollout_steps * rollout_batch_size == n_train_examples * group_size
-assert (rollout_batch_size / group_size).is_integer()
-n_questions_per_rollout = rollout_batch_size // group_size
-print(f"Rollout batch size: {rollout_batch_size}; # Questions per rollout: {n_questions_per_rollout}; # Generations per question: {group_size}")
+n_questions_per_train_batch = train_batch_size // group_size
+print(
+    f"vLLM max concurrent sequences: {rollout_max_num_seqs}; "
+    f"# Questions per training batch: {n_questions_per_train_batch}; "
+    f"# Generations per question: {group_size}"
+)
+
+filtered_batch_collector = None
+if args.difficulty_filter == "empirical-reward":
+    filtered_batch_collector = EmpiricalRewardRolloutBatchCollector(
+        rollout_server=llm_rollout,
+        train_rows=train_dataset,
+        reward_fn=r1_zero_reward_fn,
+        sampling_params=sampling_params,
+        train_batch_size=train_batch_size,
+        group_size=group_size,
+        lower_bound=args.difficulty_lower_bound,
+        upper_bound=args.difficulty_upper_bound,
+        max_candidate_groups=(
+            args.max_candidate_groups_multiplier
+            * n_questions_per_train_batch
+        ),
+        scheduler_seed=seed,
+    )
+next_unfiltered_train_index = 0
 
 from tqdm import tqdm
 
@@ -280,31 +340,67 @@ wandb_run.log(data={
 
 for i in tqdm(range(num_rollout_steps), desc="GRPO training steps"):
     time_metrics = {}
-    train_rows = train_dataset[i*n_questions_per_rollout:(i+1)*n_questions_per_rollout]
-    print(f"Generating rollouts for the following {len(train_rows)} questions (answers): ", [train_row["question"].split()[0] + f" ({train_row['answer']})" for train_row in train_rows])
-    # Curate repeated prompts for generating rollouts
-    vllm_prompts, prompts, answers = list(), list(), list()
-    for train_row in train_rows:
-        vllm_prompts.append(train_row["prompt"])
-        prompts.extend([train_row["prompt"]] * group_size)
-        answers.extend([train_row["answer"]] * group_size)
-    assert len(prompts) == len(answers) == rollout_batch_size
-    # Generate rollouts
-    print(f"Generating {len(prompts)} rollouts with vLLM...")
+    collection_metrics = {}
+    precomputed_reward_dicts = None
+    collected_batch_for_recording = None
     with track_cuda_memory_and_time(
         "rollout_full_batch",
         time_metrics=time_metrics,
         track_memory=False,
         track_time=track_step_time,
     ):
-        completions = llm_rollout.generate_completions(
-            prompts=vllm_prompts,
-            sampling_params=sampling_params,  # NOTE: "n": group_size --> so I use vllm_prompts instead of prompts
-            batch_size=rollout_batch_size
-        )
-        responses = [completion.text for completion in completions]
-        print(f"Successfully generated {len(responses)} rollouts for {len(prompts)} prompts!")
-        assert len(prompts) == len(responses)
+        if filtered_batch_collector is not None:
+            collected_batch = filtered_batch_collector.collect()
+            collected_batch_for_recording = collected_batch
+            prompts = collected_batch.repeated_prompts
+            responses = collected_batch.rollout_responses
+            answers = collected_batch.repeated_ground_truths
+            precomputed_reward_dicts = collected_batch.reward_dicts
+            collection_metrics = collected_batch.metrics
+        else:
+            train_row_indices = [
+                (
+                    next_unfiltered_train_index + offset
+                ) % len(train_dataset)
+                for offset in range(n_questions_per_train_batch)
+            ]
+            train_rows = [
+                train_dataset[index] for index in train_row_indices
+            ]
+            next_unfiltered_train_index = (
+                next_unfiltered_train_index
+                + n_questions_per_train_batch
+            ) % len(train_dataset)
+            print(
+                f"Generating rollouts for the following {len(train_rows)} "
+                "questions (answers): ",
+                [
+                    train_row["question"].split()[0]
+                    + f" ({train_row['answer']})"
+                    for train_row in train_rows
+                ],
+            )
+            vllm_prompts, prompts, answers = list(), list(), list()
+            for train_row in train_rows:
+                vllm_prompts.append(train_row["prompt"])
+                prompts.extend([train_row["prompt"]] * group_size)
+                answers.extend([train_row["answer"]] * group_size)
+            step_sampling_params = dict(sampling_params)
+            step_sampling_params["seed"] = (
+                seed + i * n_questions_per_train_batch
+            )
+            completions = llm_rollout.generate_completions(
+                prompts=vllm_prompts,
+                sampling_params=step_sampling_params,
+                batch_size=None,
+            )
+            responses = [completion.text for completion in completions]
+
+    assert len(prompts) == len(responses) == len(answers) == train_batch_size
+    print(
+        f"Successfully collected {len(responses)} training rollouts from "
+        f"{len(prompts) // group_size} questions!"
+    )
     # Print out sampled generations every 10 steps
     if i % 10 == 0:
         print(f"Prompt: {prompts[0]}")
@@ -334,6 +430,11 @@ for i in tqdm(range(num_rollout_steps), desc="GRPO training steps"):
             track_step_time=track_step_time,
             add_cc_sft_loss=args.add_cc_sft_loss,
             cc_sft_loss_lambda=args.cc_sft_loss_lambda,
+            precomputed_reward_dicts=precomputed_reward_dicts,
+        )
+    if collected_batch_for_recording is not None:
+        filtered_batch_collector.record_trained(
+            collected_batch_for_recording
         )
     # Sync weights
     print("Syncing weights of the rollout LLM to be the same with the updated policy LLM...")
@@ -366,6 +467,10 @@ for i in tqdm(range(num_rollout_steps), desc="GRPO training steps"):
     wandb_run.log(data={
         "train/loss": train_step_loss,
         **{f"train/{key}": value for key, value in train_step_metadata.items()},
+        **{
+            f"train/filter/{key}": value
+            for key, value in collection_metrics.items()
+        },
         **memory_metrics,
         **time_metrics,
     }, step=i)

@@ -238,10 +238,28 @@ def get_response_log_probs(
     return outputs
 
 
+def score_rollout_responses(
+    reward_fn: Callable[[str, str], dict[str, float]],
+    rollout_responses: list[str],
+    repeated_ground_truths: list[str],
+) -> list[dict[str, float]]:
+    """Grade each rollout response once and retain every reward component."""
+    if len(rollout_responses) != len(repeated_ground_truths):
+        raise ValueError(
+            "rollout_responses and repeated_ground_truths must have the same "
+            f"length, got {len(rollout_responses)} and {len(repeated_ground_truths)}"
+        )
+    return [
+        reward_fn(response, ground_truth)
+        for response, ground_truth in zip(rollout_responses, repeated_ground_truths)
+    ]
+
+
 def compute_rollout_rewards(
     reward_fn: Callable[[str, str], dict[str, float]],
     rollout_responses: list[str],
     repeated_ground_truths: list[str],
+    precomputed_reward_dicts: list[dict[str, float]] | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Compute rewards for a list of rollout responses, along with metadata for
     the reward components.
@@ -257,6 +275,9 @@ def compute_rollout_rewards(
             The ground truths for the examples. The length of this list is
             rollout_batch_size, because the ground truth for each example is
             repeated group_size times.
+        precomputed_reward_dicts: list[dict[str, float]] | None
+            Optional per-response reward dictionaries previously produced by
+            score_rollout_responses. When provided, reward_fn is not called.
 
     Returns:
         tuple[torch.Tensor, dict[str, float]].
@@ -267,11 +288,25 @@ def compute_rollout_rewards(
                 Reward statistics to log. At minimum, include the mean total
                 and format rewards over the rollout batch.
     """
-    assert len(rollout_responses) == len(repeated_ground_truths)
-    reward_dicts = [
-        reward_fn(res, gt)
-        for res, gt in zip(rollout_responses, repeated_ground_truths)
-    ]
+    if len(rollout_responses) != len(repeated_ground_truths):
+        raise ValueError(
+            "rollout_responses and repeated_ground_truths must have the same "
+            f"length, got {len(rollout_responses)} and {len(repeated_ground_truths)}"
+        )
+    reward_dicts = (
+        score_rollout_responses(
+            reward_fn,
+            rollout_responses,
+            repeated_ground_truths,
+        )
+        if precomputed_reward_dicts is None
+        else precomputed_reward_dicts
+    )
+    if len(reward_dicts) != len(rollout_responses):
+        raise ValueError(
+            "precomputed_reward_dicts and rollout_responses must have the same "
+            f"length, got {len(reward_dicts)} and {len(rollout_responses)}"
+        )
     raw_rewards = torch.tensor([reward_dict["reward"] for reward_dict in reward_dicts])
     format_rewards = torch.tensor([reward_dict["format_reward"] for reward_dict in reward_dicts])
     metadata = {
@@ -506,6 +541,7 @@ def grpo_train_step(
     track_step_time: bool = False,
     add_cc_sft_loss: bool = False,
     cc_sft_loss_lambda: float = 1.0,
+    precomputed_reward_dicts: list[dict[str, float]] | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor | float]]:
     """Execute forward-and-backward passes, with gradient_accumulation_steps
     microbatches.
@@ -563,6 +599,9 @@ def grpo_train_step(
         normalization_constant: int | None = None
             The constant to divide total loss by; required if
             loss_normalization = "constant".
+        precomputed_reward_dicts: list[dict[str, float]] | None
+            Optional per-response rewards computed during rollout collection.
+            When provided, reward_fn is not called again.
 
     Returns:
         tuple[torch.Tensor, dict[str, torch.Tensor]].
@@ -581,7 +620,12 @@ def grpo_train_step(
         track_memory=False,
         track_time=track_step_time,
     ):
-        raw_rewards, raw_rewards_metadata = compute_rollout_rewards(reward_fn, rollout_responses, repeated_ground_truths)
+        raw_rewards, raw_rewards_metadata = compute_rollout_rewards(
+            reward_fn,
+            rollout_responses,
+            repeated_ground_truths,
+            precomputed_reward_dicts=precomputed_reward_dicts,
+        )
         advantages, advantages_metadata = compute_group_normalized_rewards(raw_rewards, group_size, baseline, advantage_eps, advantage_normalizer)
     assert len(repeated_prompts) == len(rollout_responses) == len(repeated_ground_truths)
     batch_size = len(repeated_prompts)
