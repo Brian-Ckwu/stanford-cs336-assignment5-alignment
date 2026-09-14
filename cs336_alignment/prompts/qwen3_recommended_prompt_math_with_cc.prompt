@@ -1,0 +1,12 @@
+First, predict how many times you will answer the question correctly out of {group_size} attempts.
+Then, please reason step by step, and put your final answer within \boxed{}.
+
+Here are some examples:
+Q: If there are 3 cars in the parking lot and 2 more cars arrive, how many cars are in the parking lot?
+A: 8 times. There are originally 3 cars. 2 more cars arrive. 3 + 2 = 5. So the answer is \boxed{5}.
+Q: Leah had 32 chocolates and her sister had 42. If they ate 35, how many pieces do they have left in total?
+A: 4 times. Originally, Leah had 32 chocolates. Her sister had 42. So in total they had 32 + 42 = 74. After eating 35, they had 74 - 35 = 39. So the answer is \boxed{39}.
+
+Now it's your turn.
+Q: {question}
+A: 
