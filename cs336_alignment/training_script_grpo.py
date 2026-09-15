@@ -1,4 +1,7 @@
 import argparse
+import json
+from pathlib import Path
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train OLMo with GRPO on GSM8K.")
@@ -29,9 +32,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--confidence-estimator-lora-dir",
-        type=str | None,
+        type=str,
         default=None,
-        help="(Optional) Only needed when --difficulty-filter is set to confidence-estimator"
+        help=(
+            "Required when --difficulty-filter is set to confidence-estimator. "
+            "The directory must contain adapter_config.json and "
+            "token_confidence_config.json."
+        ),
+    )
+    parser.add_argument(
+        "--confidence-estimator-batch-size",
+        type=int,
+        default=1024,
+        help="Prompt batch size for confidence-estimator inference.",
     )
     parser.add_argument("--difficulty-lower-bound", type=float, default=0.2)
     parser.add_argument("--difficulty-upper-bound", type=float, default=0.8)
@@ -155,6 +168,12 @@ lora_dropout = args.lora_dropout
 lora_adapter_name = args.lora_adapter_name
 lora_target_modules = args.lora_target_modules
 autocast_adapter_dtype = args.autocast_adapter_dtype
+confidence_estimator_lora_dir = (
+    None
+    if args.confidence_estimator_lora_dir is None
+    else Path(args.confidence_estimator_lora_dir).resolve()
+)
+confidence_estimator_batch_size = args.confidence_estimator_batch_size
 
 if rollout_max_num_seqs <= 0:
     raise ValueError("--rollout-max-num-seqs must be positive")
@@ -168,8 +187,54 @@ if args.max_candidate_groups_multiplier <= 0:
     raise ValueError("--max-candidate-groups-multiplier must be positive")
 if args.save_only_adapter and not use_peft:
     raise ValueError("--save-only-adapter requires --use-peft")
-if (args.difficulty_filter == "confidence-estimator") and (args.confidence_estimator_lora_dir is None):
-    raise ValueError("--args.confidence-estimator-lora-dir must be specified when args.difficulty-filter is confidence-estimator")
+if confidence_estimator_batch_size <= 0:
+    raise ValueError("--confidence-estimator-batch-size must be positive")
+if (
+    args.difficulty_filter == "confidence-estimator"
+    and confidence_estimator_lora_dir is None
+):
+    raise ValueError(
+        "--confidence-estimator-lora-dir must be specified when "
+        "--difficulty-filter is confidence-estimator"
+    )
+if args.difficulty_filter == "confidence-estimator" and not use_peft:
+    raise ValueError("--difficulty-filter confidence-estimator requires --use-peft")
+
+confidence_adapter_config = None
+confidence_metadata = None
+confidence_candidate_token_ids: tuple[int, ...] = ()
+confidence_lora_rank = 0
+if confidence_estimator_lora_dir is not None:
+    adapter_config_path = confidence_estimator_lora_dir / "adapter_config.json"
+    metadata_path = confidence_estimator_lora_dir / "token_confidence_config.json"
+    for required_path in (adapter_config_path, metadata_path):
+        if not required_path.is_file():
+            raise FileNotFoundError(required_path)
+    with adapter_config_path.open() as handle:
+        confidence_adapter_config = json.load(handle)
+    with metadata_path.open() as handle:
+        confidence_metadata = json.load(handle)
+    confidence_base_model = confidence_adapter_config["base_model_name_or_path"]
+    if confidence_base_model != model_id:
+        raise ValueError(
+            "Confidence estimator and policy must share the same base model: "
+            f"{confidence_base_model!r} != {model_id!r}"
+        )
+    confidence_group_size = int(confidence_metadata["group_size"])
+    if confidence_group_size != group_size:
+        raise ValueError(
+            "Confidence estimator group size does not match --group-size: "
+            f"{confidence_group_size} != {group_size}"
+        )
+    confidence_candidate_token_ids = tuple(
+        int(token_id) for token_id in confidence_metadata["candidate_token_ids"]
+    )
+    if len(confidence_candidate_token_ids) != group_size + 1:
+        raise ValueError(
+            "Confidence estimator must define one candidate token for each "
+            "count from 0 through --group-size"
+        )
+    confidence_lora_rank = int(confidence_adapter_config["r"])
 
 sampling_params = {
     "temperature": sampling_temperature,
@@ -201,6 +266,12 @@ wandb_config = {
     "max_candidate_groups_multiplier": (
         args.max_candidate_groups_multiplier
     ),
+    "confidence_estimator_lora_dir": (
+        None
+        if confidence_estimator_lora_dir is None
+        else str(confidence_estimator_lora_dir)
+    ),
+    "confidence_estimator_batch_size": confidence_estimator_batch_size,
 }
 wandb_run = wandb.init(project=wandb_project_name, name=wandb_exp_name, config=wandb_config)
 
@@ -212,8 +283,6 @@ import random
 random.seed(seed)
 
 # Load dataset
-import json
-
 with open(prompt_path) as f:
     prompt_template = f.read()
 
@@ -270,7 +339,10 @@ optimizer = torch.optim.AdamW(
 )
 
 # B: rollout model
-from vllm_utils import VLLMServer
+from vllm_utils import VLLMConfidenceEstimator, VLLMServer
+
+confidence_filter_enabled = args.difficulty_filter == "confidence-estimator"
+rollout_max_lora_rank = max(lora_r, confidence_lora_rank)
 
 llm_rollout = VLLMServer(
     model_id=model_id,
@@ -279,8 +351,8 @@ llm_rollout = VLLMServer(
     gpu_memory_utilization=gpu_memory_utilization,
     weight_transfer_backend=weight_transfer_backend,
     enable_lora=use_peft,
-    max_lora_rank=lora_r,
-    max_loras=1,
+    max_lora_rank=rollout_max_lora_rank,
+    max_loras=2 if confidence_filter_enabled else 1,
     max_num_seqs=rollout_max_num_seqs,
 )
 print(f"Starting the rollout model (vLLM service)...")
@@ -298,10 +370,28 @@ if use_peft:
 else:
     llm_rollout.init_weight_sync(policy_device=llm_policy_device)  # NOTE: Create the communication channel between two llms
 
+confidence_estimator = None
+if confidence_filter_enabled:
+    confidence_adapter_name = "confidence-estimator"
+    llm_rollout.load_lora_adapter(
+        confidence_adapter_name,
+        str(confidence_estimator_lora_dir),
+        set_default=False,
+    )
+    confidence_estimator = VLLMConfidenceEstimator(
+        server=llm_rollout,
+        adapter_name=confidence_adapter_name,
+        candidate_token_ids=confidence_candidate_token_ids,
+        group_size=group_size,
+    )
+
 # Training loop
 from grpo_core_implementation import grpo_train_step, track_cuda_memory_and_time
 from drgrpo_grader import r1_zero_reward_fn
-from rollout_batch_collection import EmpiricalRewardRolloutBatchCollector
+from rollout_batch_collection import (
+    ConfidenceEstimatorRolloutBatchCollector,
+    EmpiricalRewardRolloutBatchCollector,
+)
 
 n_questions_per_train_batch = train_batch_size // group_size
 print(
@@ -328,7 +418,23 @@ if args.difficulty_filter == "empirical-reward":
         scheduler_seed=seed,
     )
 elif args.difficulty_filter == "confidence-estimator":
-    filtered_batch_collector = NotImplemented
+    filtered_batch_collector = ConfidenceEstimatorRolloutBatchCollector(
+        rollout_server=llm_rollout,
+        train_rows=train_dataset,
+        reward_fn=r1_zero_reward_fn,
+        confidence_estimator=confidence_estimator,
+        sampling_params=sampling_params,
+        train_batch_size=train_batch_size,
+        group_size=group_size,
+        lower_bound=args.difficulty_lower_bound,
+        upper_bound=args.difficulty_upper_bound,
+        max_candidate_groups=(
+            args.max_candidate_groups_multiplier
+            * n_questions_per_train_batch
+        ),
+        confidence_batch_size=confidence_estimator_batch_size,
+        scheduler_seed=seed,
+    )
 next_unfiltered_train_index = 0
 
 from tqdm import tqdm
@@ -478,7 +584,11 @@ for i in tqdm(range(num_rollout_steps), desc="GRPO training steps"):
         "train/loss": train_step_loss,
         **{f"train/{key}": value for key, value in train_step_metadata.items()},
         **{
-            f"train/filter/{key}": value
+            (
+                key
+                if key.startswith("calibration/")
+                else f"train/filter/{key}"
+            ): value
             for key, value in collection_metrics.items()
         },
         **memory_metrics,

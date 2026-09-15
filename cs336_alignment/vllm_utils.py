@@ -5,6 +5,7 @@ Small vLLM helpers for server lifecycle, completion requests, and weight sync.
 import atexit
 import json
 import logging
+import math
 import os
 import signal
 import socket
@@ -13,7 +14,7 @@ import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, Sequence
 
 import torch
 
@@ -25,6 +26,13 @@ class VLLMCompletion:
     text: str
     token_ids: list[int]
     finish_reason: str | None
+
+
+@dataclass(frozen=True)
+class VLLMConfidencePredictions:
+    hard_confidences: list[float]
+    expected_confidences: list[float]
+    metrics: dict[str, float]
 
 
 @dataclass
@@ -102,6 +110,7 @@ class VLLMServer:
         path: str,
         *,
         load_inplace: bool = False,
+        set_default: bool = True,
     ) -> None:
         if not self.enable_lora:
             raise RuntimeError("Start the vLLM server with enable_lora=True.")
@@ -117,19 +126,62 @@ class VLLMServer:
         )
         # Prefix-cache entries produced by older adapter weights are stale.
         _http_json("POST", f"{self.base_url}/reset_prefix_cache", timeout=60)
-        self.served_model_id = name
+        if set_default:
+            self.served_model_id = name
 
     def generate_completions(
         self,
         prompts: list[str],
         sampling_params: dict,
         batch_size: int | None = None,
+        model_id: str | None = None,
     ) -> list[VLLMCompletion]:
         return generate_completions(
             vllm_base_url=self.base_url,
-            model_id=self.served_model_id,
+            model_id=self.served_model_id if model_id is None else model_id,
             prompts=prompts,
             sampling_params=sampling_params,
+            batch_size=batch_size,
+        )
+
+    def generate_confidence_predictions(
+        self,
+        prompts: Sequence[str],
+        *,
+        model_id: str,
+        candidate_token_ids: Sequence[int],
+        group_size: int,
+        batch_size: int,
+    ) -> VLLMConfidencePredictions:
+        return generate_confidence_predictions(
+            vllm_base_url=self.base_url,
+            model_id=model_id,
+            prompts=prompts,
+            candidate_token_ids=candidate_token_ids,
+            group_size=group_size,
+            batch_size=batch_size,
+            seed=self.seed,
+        )
+
+
+@dataclass(frozen=True)
+class VLLMConfidenceEstimator:
+    server: VLLMServer
+    adapter_name: str
+    candidate_token_ids: tuple[int, ...]
+    group_size: int
+
+    def predict_confidences(
+        self,
+        prompts: Sequence[str],
+        *,
+        batch_size: int,
+    ) -> VLLMConfidencePredictions:
+        return self.server.generate_confidence_predictions(
+            prompts,
+            model_id=self.adapter_name,
+            candidate_token_ids=self.candidate_token_ids,
+            group_size=self.group_size,
             batch_size=batch_size,
         )
 
@@ -300,6 +352,100 @@ def generate_completions(
             for choice in choices
         )
     return completions
+
+
+def generate_confidence_predictions(
+    vllm_base_url: str,
+    model_id: str,
+    prompts: Sequence[str],
+    candidate_token_ids: Sequence[int],
+    group_size: int,
+    batch_size: int,
+    seed: int,
+) -> VLLMConfidencePredictions:
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    if group_size <= 0:
+        raise ValueError("group_size must be positive")
+    if len(candidate_token_ids) != group_size + 1:
+        raise ValueError("Expected one candidate token for each count from 0 to group_size")
+    if len(set(candidate_token_ids)) != len(candidate_token_ids):
+        raise ValueError("candidate_token_ids must be unique")
+
+    hard_confidences: list[float] = []
+    expected_confidences: list[float] = []
+    instances_with_missing_logprobs = 0
+    prompt_list = list(prompts)
+    started = time.perf_counter()
+    for start in range(0, len(prompt_list), batch_size):
+        prompt_batch = prompt_list[start : start + batch_size]
+        payload = {
+            "model": model_id,
+            "prompt": prompt_batch,
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "top_k": 0,
+            "max_tokens": 1,
+            "n": 1,
+            "seed": seed,
+            "logprobs": len(candidate_token_ids),
+            "allowed_token_ids": list(candidate_token_ids),
+            "return_tokens_as_token_ids": True,
+        }
+        response = _http_json(
+            "POST",
+            f"{vllm_base_url}/v1/completions",
+            payload,
+            timeout=3600,
+        )
+        choices = sorted(response["choices"], key=lambda choice: choice["index"])
+        if len(choices) != len(prompt_batch):
+            raise RuntimeError(
+                f"Expected {len(prompt_batch)} confidence choices, got {len(choices)}"
+            )
+
+        for choice in choices:
+            logprobs = choice.get("logprobs")
+            top_logprobs = None if logprobs is None else logprobs.get("top_logprobs")
+            if not top_logprobs or top_logprobs[0] is None:
+                raise RuntimeError("vLLM did not return confidence token log-probabilities")
+            token_logprobs = top_logprobs[0]
+            candidate_logprobs = [
+                float(token_logprobs.get(f"token_id:{token_id}", -math.inf))
+                for token_id in candidate_token_ids
+            ]
+            if any(not math.isfinite(value) for value in candidate_logprobs):
+                instances_with_missing_logprobs += 1
+            maximum = max(candidate_logprobs)
+            weights = [
+                math.exp(value - maximum) if math.isfinite(value) else 0.0
+                for value in candidate_logprobs
+            ]
+            normalizer = sum(weights)
+            if normalizer == 0.0:
+                raise RuntimeError("No candidate confidence token had finite probability")
+            probabilities = [weight / normalizer for weight in weights]
+            predicted_count = max(
+                range(len(probabilities)),
+                key=probabilities.__getitem__,
+            )
+            expected_count = sum(
+                count * probability
+                for count, probability in enumerate(probabilities)
+            )
+            hard_confidences.append(predicted_count / group_size)
+            expected_confidences.append(expected_count / group_size)
+
+    return VLLMConfidencePredictions(
+        hard_confidences=hard_confidences,
+        expected_confidences=expected_confidences,
+        metrics={
+            "instances_with_missing_logprobs": float(
+                instances_with_missing_logprobs
+            ),
+            "inference_seconds": time.perf_counter() - started,
+        },
+    )
 
 
 def init_weight_sync(vllm_base_url: str, policy_device: str):

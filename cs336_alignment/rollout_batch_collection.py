@@ -9,6 +9,7 @@ collectors decide when and how a candidate question is difficulty-filtered.
 from __future__ import annotations
 
 import heapq
+import math
 import random
 from abc import ABC, abstractmethod
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
@@ -16,8 +17,10 @@ from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Protocol, Sequence, final
 
 try:
+    from .confidence_training.metrics import compute_metrics
     from .grpo_core_implementation import score_rollout_responses
 except ImportError:
+    from confidence_training.metrics import compute_metrics
     from grpo_core_implementation import score_rollout_responses
 
 
@@ -34,6 +37,12 @@ class RolloutServer(Protocol):
     ) -> Sequence[Completion]: ...
 
 
+class ConfidencePredictions(Protocol):
+    hard_confidences: Sequence[float]
+    expected_confidences: Sequence[float]
+    metrics: Mapping[str, float]
+
+
 class ConfidenceEstimator(Protocol):
     """Minimal interface required by the confidence-filtering collector.
 
@@ -44,7 +53,9 @@ class ConfidenceEstimator(Protocol):
     def predict_confidences(
         self,
         prompts: Sequence[str],
-    ) -> Sequence[float]: ...
+        *,
+        batch_size: int,
+    ) -> ConfidencePredictions: ...
 
 
 @dataclass(frozen=True)
@@ -506,8 +517,7 @@ class EmpiricalRewardRolloutBatchCollector(RolloutBatchCollector):
 
 
 class ConfidenceEstimatorRolloutBatchCollector(RolloutBatchCollector):
-    """Filter candidate questions before rollout using predicted confidence.
-    """
+    """Filter candidate questions before rollout using predicted confidence."""
 
     def __init__(
         self,
@@ -541,40 +551,244 @@ class ConfidenceEstimatorRolloutBatchCollector(RolloutBatchCollector):
             raise ValueError("confidence_batch_size must be positive")
         self.confidence_estimator = confidence_estimator
         self.confidence_batch_size = confidence_batch_size
+        self.next_training_row_index = 0
+        self.collection_step = 0
+
+    def _next_candidate_row_index(
+        self,
+        *,
+        cursor: int,
+        unavailable: set[int],
+        attempt_counts: Sequence[int],
+    ) -> tuple[int, int]:
+        available = [
+            index
+            for index in range(len(self.train_rows))
+            if index not in unavailable
+        ]
+        if not available:
+            raise RuntimeError("No unexamined training rows remain")
+        minimum_key = min(
+            (self.training_counts[index], attempt_counts[index])
+            for index in available
+        )
+        for offset in range(len(self.train_rows)):
+            index = (cursor + offset) % len(self.train_rows)
+            if index in unavailable:
+                continue
+            key = (self.training_counts[index], attempt_counts[index])
+            if key == minimum_key:
+                return index, (index + 1) % len(self.train_rows)
+        raise RuntimeError("Could not choose the next confidence candidate")
+
+    def _validate_confidences(
+        self,
+        values: Sequence[float],
+        *,
+        name: str,
+    ) -> list[float]:
+        if len(values) != len(self.train_rows):
+            raise ValueError(
+                f"Expected {len(self.train_rows)} {name} values, got {len(values)}"
+            )
+        converted = [float(value) for value in values]
+        invalid = [
+            value
+            for value in converted
+            if not math.isfinite(value) or not 0.0 <= value <= 1.0
+        ]
+        if invalid:
+            raise ValueError(f"{name} values must be finite and in [0, 1]")
+        return converted
 
     def _collect_groups(
         self,
     ) -> tuple[list[RolloutGroup], dict[str, float]]:
-        """Implement confidence-first collection here.
-
-        Suggested sequence:
-
-        1. Create per-collection attempt counts and candidate bookkeeping.
-        2. Use ``_sample_training_row_indices`` to choose fairly among rows,
-           and assign every scored candidate an index with
-           ``_allocate_candidate_index`` for deterministic ordering/seeding.
-        3. Batch their exact prompts through
-           ``self.confidence_estimator.predict_confidences``.
-        4. Accept predictions in ``[lower_bound, upper_bound]`` and retain the
-           most intermediate candidates for the budget-exhaustion fallback.
-        5. Generate ``group_size`` on-policy responses only for the selected
-           questions, reusing each candidate's stored index when deriving its
-           rollout seed through the parent helpers.
-        6. Call ``_build_group`` with the predicted confidence as
-           ``filter_score`` and ``filter_score_source='confidence_estimator'``.
-           This still calculates the empirical rewards required by GRPO.
-        7. Return exactly ``target_groups`` groups plus clearly named metrics
-           that distinguish predicted confidence from empirical reward.
-
-        The public ``collect`` method will validate and flatten the result, and
-        ``record_trained`` will update persistent sampling counts afterward.
-        """
-        # My design ideas
-        # 1. Inference on the full training set
-        # 2. Sample uniformly from the least frequently (trained, attempted) ones until self.target_groups are collected
-        # 3. Perform actual rollouts on the target groups
-        # 4. Calculate calibration metrics (mse, spearman, expected_mse, expected_spearman) on the target group to measure the confidence estimator's calibration performance change when as the policy updates,
-        # these calibration metrics should be logged to wandb as calibration/<metric_name>
-        raise NotImplementedError(
-            "Implement confidence-estimator candidate selection and rollout generation"
+        import time
+        start = time.perf_counter()
+        # XXX
+        predictions = self.confidence_estimator.predict_confidences(
+            [str(row["prompt"]) for row in self.train_rows],
+            batch_size=self.confidence_batch_size,
         )
+        hard_confidences = self._validate_confidences(
+            predictions.hard_confidences,
+            name="hard confidence",
+        )
+        expected_confidences = self._validate_confidences(
+            predictions.expected_confidences,
+            name="expected confidence",
+        )
+        # XXX
+        elapsed = time.perf_counter() - start
+        print(f"Confidence estimation done {elapsed:.2f} seconds ({len(hard_confidences)} hard confidences, mean = {sum(hard_confidences) / len(hard_confidences)}; {len(expected_confidences)} expected confidences, mean = {sum(expected_confidences) / len(expected_confidences)})")  # XXX
+
+        accepted_candidates: list[tuple[int, int, float, float]] = []
+        intermediate_reservoir: list[
+            tuple[float, int, tuple[int, int, float, float]]
+        ] = []
+        attempt_counts = [0] * len(self.train_rows)
+        considered_rows: set[int] = set()
+        candidate_cursor = self.next_training_row_index
+        in_range_candidates = 0
+        candidate_score_sum = 0.0
+        candidate_budget = min(self.max_candidate_groups, len(self.train_rows))
+
+        # XXX
+        print(f"Candidate budget = {candidate_budget}")
+        start = time.perf_counter()
+        while (
+            len(accepted_candidates) < self.target_groups
+            and len(considered_rows) < candidate_budget
+        ):
+            training_row_index, candidate_cursor = self._next_candidate_row_index(
+                cursor=candidate_cursor,
+                unavailable=considered_rows,
+                attempt_counts=attempt_counts,
+            )
+            considered_rows.add(training_row_index)
+            attempt_counts[training_row_index] += 1
+            candidate_index = self._allocate_candidate_index()
+            hard_confidence = hard_confidences[training_row_index]
+            expected_confidence = expected_confidences[training_row_index]
+            candidate = (
+                training_row_index,
+                candidate_index,
+                hard_confidence,
+                expected_confidence,
+            )
+            candidate_score_sum += expected_confidence
+
+            reservoir_item = (
+                -abs(expected_confidence - 0.5),
+                -candidate_index,
+                candidate,
+            )
+            if len(intermediate_reservoir) < self.target_groups:
+                heapq.heappush(intermediate_reservoir, reservoir_item)
+            elif reservoir_item > intermediate_reservoir[0]:
+                heapq.heapreplace(intermediate_reservoir, reservoir_item)
+
+            if self.lower_bound <= expected_confidence <= self.upper_bound:
+                in_range_candidates += 1
+                accepted_candidates.append(candidate)
+
+        used_intermediate_fallback = (
+            len(accepted_candidates) < self.target_groups
+        )
+        if used_intermediate_fallback:
+            if len(intermediate_reservoir) < self.target_groups:
+                raise RuntimeError(
+                    "Candidate budget ended before enough confidence candidates "
+                    "were considered"
+                )
+            selected_candidates = sorted(
+                (item[2] for item in intermediate_reservoir),
+                key=lambda candidate: (
+                    abs(candidate[3] - 0.5),
+                    candidate[1],
+                ),
+            )
+        else:
+            selected_candidates = sorted(
+                accepted_candidates,
+                key=lambda candidate: candidate[1],
+            )
+        # XXX
+        elapsed = time.perf_counter() - start
+        print(f"{elapsed:.2f} seconds elapsed for candidate selection")
+        selected_prompts = [
+            str(self.train_rows[candidate[0]]["prompt"])
+            for candidate in selected_candidates
+        ]
+        rollout_sampling_params = dict(self.sampling_params)
+        rollout_sampling_params["seed"] = (
+            self.base_seed + self.collection_step * self.target_groups
+        )
+        # XXX
+        start = time.perf_counter()
+        completions = self.rollout_server.generate_completions(
+            prompts=selected_prompts,
+            sampling_params=rollout_sampling_params,
+            batch_size=None,
+        )
+        elapsed = time.perf_counter() - start
+        print(f"{elapsed:.2f} seconds for rollout generation")
+        expected_completion_count = self.target_groups * self.group_size
+        if len(completions) != expected_completion_count:
+            raise RuntimeError(
+                f"Expected {expected_completion_count} completions, "
+                f"got {len(completions)}"
+            )
+
+        selected_groups: list[RolloutGroup] = []
+        selected_hard_confidences: list[float] = []
+        selected_expected_confidences: list[float] = []
+        for group_index, candidate in enumerate(selected_candidates):
+            training_row_index, candidate_index, hard_confidence, expected_confidence = candidate
+            start = group_index * self.group_size
+            group = self._build_group(
+                training_row_index=training_row_index,
+                candidate_index=candidate_index,
+                completions=completions[start : start + self.group_size],
+                filter_score=expected_confidence,
+                filter_score_source="confidence_estimator_expected",
+            )
+            selected_groups.append(group)
+            selected_hard_confidences.append(hard_confidence)
+            selected_expected_confidences.append(expected_confidence)
+
+        empirical_targets = [group.mean_reward for group in selected_groups]
+        hard_metrics = compute_metrics(
+            selected_hard_confidences,
+            empirical_targets,
+        )
+        expected_metrics = compute_metrics(
+            selected_expected_confidences,
+            empirical_targets,
+        )
+        candidate_questions = len(considered_rows)
+        metrics = {
+            "confidence_scored_questions": float(len(self.train_rows)),
+            "candidate_questions": float(candidate_questions),
+            "candidate_rollouts": float(expected_completion_count),
+            "unique_candidate_questions": float(candidate_questions),
+            "in_range_questions": float(in_range_candidates),
+            "selected_questions": float(self.target_groups),
+            "acceptance_rate": in_range_candidates / candidate_questions,
+            "candidate_mean_filter_score": candidate_score_sum / candidate_questions,
+            "selected_mean_filter_score": sum(selected_expected_confidences)
+            / self.target_groups,
+            "selected_mean_hard_confidence": sum(selected_hard_confidences)
+            / self.target_groups,
+            "selected_mean_reward": sum(empirical_targets) / self.target_groups,
+            "used_intermediate_fallback": float(used_intermediate_fallback),
+            "selected_out_of_range_questions": float(
+                sum(
+                    not self.lower_bound
+                    <= candidate[3]
+                    <= self.upper_bound
+                    for candidate in selected_candidates
+                )
+            ),
+            "max_attempts_per_question": float(max(attempt_counts)),
+            "training_count_min_before": float(min(self.training_counts)),
+            "training_count_max_before": float(max(self.training_counts)),
+            "training_count_mean_before": sum(self.training_counts)
+            / len(self.training_counts),
+            "calibration/mse": float(hard_metrics["mse"]),
+            "calibration/spearman_r": float(hard_metrics["spearman_r"]),
+            "calibration/expected_mse": float(expected_metrics["mse"]),
+            "calibration/expected_spearman_r": float(
+                expected_metrics["spearman_r"]
+            ),
+        }
+        metrics.update(
+            {
+                f"confidence_{name}": float(value)
+                for name, value in predictions.metrics.items()
+            }
+        )
+        self.next_training_row_index = candidate_cursor
+        self.collection_step += 1
+        return selected_groups, metrics
