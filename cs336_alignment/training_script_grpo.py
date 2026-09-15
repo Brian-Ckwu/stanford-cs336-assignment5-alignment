@@ -23,6 +23,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-rollout-steps", type=int, default=200)
     parser.add_argument("--learning-rate", type=float, default=1e-5)
     parser.add_argument("--vllm-max-num-seqs", type=int, default=256)
+    parser.add_argument("--max-num-batched-tokens", type=int, default=None)
     parser.add_argument("--train-batch-size", type=int, default=256)
     parser.add_argument("--valid-batch-size", type=int, default=1024)
     parser.add_argument(
@@ -43,7 +44,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--confidence-estimator-batch-size",
         type=int,
-        default=1024,
+        default=6400,
         help="Prompt batch size for confidence-estimator inference.",
     )
     parser.add_argument("--difficulty-lower-bound", type=float, default=0.2)
@@ -149,6 +150,7 @@ n_val_examples = args.n_val_examples
 num_rollout_steps = args.num_rollout_steps
 learning_rate = args.learning_rate
 vllm_max_num_seqs = args.vllm_max_num_seqs
+max_num_batched_tokens = args.max_num_batched_tokens
 train_batch_size = args.train_batch_size
 group_size = args.group_size
 gradient_accumulation_steps = args.gradient_accumulation_steps
@@ -177,6 +179,8 @@ confidence_estimator_batch_size = args.confidence_estimator_batch_size
 
 if vllm_max_num_seqs <= 0:
     raise ValueError("--vllm-max-num-seqs must be positive")
+if max_num_batched_tokens is not None and max_num_batched_tokens <= 0:
+    raise ValueError("--max-num-batched-tokens must be positive")
 if train_batch_size <= 0:
     raise ValueError("--train-batch-size must be positive")
 if group_size <= 0:
@@ -263,6 +267,7 @@ wandb_config = {
     "difficulty_lower_bound": args.difficulty_lower_bound,
     "difficulty_upper_bound": args.difficulty_upper_bound,
     "vllm_max_num_seqs": vllm_max_num_seqs,
+    "max_num_batched_tokens": max_num_batched_tokens,
     "max_candidate_groups_multiplier": (
         args.max_candidate_groups_multiplier
     ),
@@ -354,6 +359,7 @@ llm_rollout = VLLMServer(
     max_lora_rank=rollout_max_lora_rank,
     max_loras=2 if confidence_filter_enabled else 1,
     max_num_seqs=vllm_max_num_seqs,
+    max_num_batched_tokens=max_num_batched_tokens,
 )
 print(f"Starting the rollout model (vLLM service)...")
 llm_rollout.start()

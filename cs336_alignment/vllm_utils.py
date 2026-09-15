@@ -51,6 +51,7 @@ class VLLMServer:
     max_loras: int = 1
     max_model_len: int = 1024
     max_num_seqs: int = 256
+    max_num_batched_tokens: int | None = None
     launch_server: bool = True
     startup_timeout: int = 600
     shutdown_timeout: int = 30
@@ -58,6 +59,11 @@ class VLLMServer:
     def __post_init__(self) -> None:
         if self.max_num_seqs <= 0:
             raise ValueError("max_num_seqs must be positive")
+        if (
+            self.max_num_batched_tokens is not None
+            and self.max_num_batched_tokens <= 0
+        ):
+            raise ValueError("max_num_batched_tokens must be positive")
         if self.port is None:
             self.port = find_available_port(self.host)
         self.base_url = f"http://{self.host}:{self.port}"
@@ -82,6 +88,7 @@ class VLLMServer:
                 max_loras=self.max_loras,
                 max_model_len=self.max_model_len,
                 max_num_seqs=self.max_num_seqs,
+                max_num_batched_tokens=self.max_num_batched_tokens,
             )
             atexit.register(self.stop)
         wait_for_server(self.base_url, self.process, self.startup_timeout)
@@ -239,6 +246,7 @@ def start_server(
     max_loras: int = 1,
     max_model_len: int = 1024,
     max_num_seqs: int = 256,
+    max_num_batched_tokens: int | None = None,
 ) -> subprocess.Popen:
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = str(gpu)
@@ -274,6 +282,10 @@ def start_server(
         "--max-num-seqs",
         str(max_num_seqs),
     ]
+    if max_num_batched_tokens is not None:
+        command.extend(
+            ["--max-num-batched-tokens", str(max_num_batched_tokens)]
+        )
     if enable_lora:
         command.extend(
             [
