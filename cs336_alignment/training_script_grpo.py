@@ -22,7 +22,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-val-examples", type=int, default=1024)
     parser.add_argument("--num-rollout-steps", type=int, default=200)
     parser.add_argument("--learning-rate", type=float, default=1e-5)
-    parser.add_argument("--rollout-max-num-seqs", type=int, default=256)
+    parser.add_argument("--vllm-max-num-seqs", type=int, default=256)
     parser.add_argument("--train-batch-size", type=int, default=256)
     parser.add_argument("--valid-batch-size", type=int, default=1024)
     parser.add_argument(
@@ -148,7 +148,7 @@ n_train_examples = args.n_train_examples
 n_val_examples = args.n_val_examples
 num_rollout_steps = args.num_rollout_steps
 learning_rate = args.learning_rate
-rollout_max_num_seqs = args.rollout_max_num_seqs
+vllm_max_num_seqs = args.vllm_max_num_seqs
 train_batch_size = args.train_batch_size
 group_size = args.group_size
 gradient_accumulation_steps = args.gradient_accumulation_steps
@@ -175,8 +175,8 @@ confidence_estimator_lora_dir = (
 )
 confidence_estimator_batch_size = args.confidence_estimator_batch_size
 
-if rollout_max_num_seqs <= 0:
-    raise ValueError("--rollout-max-num-seqs must be positive")
+if vllm_max_num_seqs <= 0:
+    raise ValueError("--vllm-max-num-seqs must be positive")
 if train_batch_size <= 0:
     raise ValueError("--train-batch-size must be positive")
 if group_size <= 0:
@@ -262,7 +262,7 @@ wandb_config = {
     "difficulty_filter": args.difficulty_filter,
     "difficulty_lower_bound": args.difficulty_lower_bound,
     "difficulty_upper_bound": args.difficulty_upper_bound,
-    "rollout_max_num_seqs": rollout_max_num_seqs,
+    "vllm_max_num_seqs": vllm_max_num_seqs,
     "max_candidate_groups_multiplier": (
         args.max_candidate_groups_multiplier
     ),
@@ -353,7 +353,7 @@ llm_rollout = VLLMServer(
     enable_lora=use_peft,
     max_lora_rank=rollout_max_lora_rank,
     max_loras=2 if confidence_filter_enabled else 1,
-    max_num_seqs=rollout_max_num_seqs,
+    max_num_seqs=vllm_max_num_seqs,
 )
 print(f"Starting the rollout model (vLLM service)...")
 llm_rollout.start()
@@ -395,7 +395,7 @@ from rollout_batch_collection import (
 
 n_questions_per_train_batch = train_batch_size // group_size
 print(
-    f"vLLM max concurrent sequences: {rollout_max_num_seqs}; "
+    f"vLLM max concurrent sequences: {vllm_max_num_seqs}; "
     f"# Questions per training batch: {n_questions_per_train_batch}; "
     f"# Generations per question: {group_size}"
 )
