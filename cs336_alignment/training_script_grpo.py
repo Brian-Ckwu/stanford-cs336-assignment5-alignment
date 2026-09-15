@@ -24,8 +24,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--valid-batch-size", type=int, default=1024)
     parser.add_argument(
         "--difficulty-filter",
-        choices=("none", "empirical-reward"),
+        choices=("none", "empirical-reward", "confidence-estimator"),
         default="none",
+    )
+    parser.add_argument(
+        "--confidence-estimator-lora-dir",
+        type=str | None,
+        default=None,
+        help="(Optional) Only needed when --difficulty-filter is set to confidence-estimator"
     )
     parser.add_argument("--difficulty-lower-bound", type=float, default=0.2)
     parser.add_argument("--difficulty-upper-bound", type=float, default=0.8)
@@ -162,6 +168,8 @@ if args.max_candidate_groups_multiplier <= 0:
     raise ValueError("--max-candidate-groups-multiplier must be positive")
 if args.save_only_adapter and not use_peft:
     raise ValueError("--save-only-adapter requires --use-peft")
+if (args.difficulty_filter == "confidence-estimator") and (args.confidence_estimator_lora_dir is None):
+    raise ValueError("--args.confidence-estimator-lora-dir must be specified when args.difficulty-filter is confidence-estimator")
 
 sampling_params = {
     "temperature": sampling_temperature,
@@ -319,6 +327,8 @@ if args.difficulty_filter == "empirical-reward":
         ),
         scheduler_seed=seed,
     )
+elif args.difficulty_filter == "confidence-estimator":
+    filtered_batch_collector = NotImplemented
 next_unfiltered_train_index = 0
 
 from tqdm import tqdm
