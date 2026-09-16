@@ -277,6 +277,9 @@ wandb_config = {
         else str(confidence_estimator_lora_dir)
     ),
     "confidence_estimator_batch_size": confidence_estimator_batch_size,
+    "confidence_estimator_cache_predictions": (
+        args.difficulty_filter == "confidence-estimator"
+    ),
 }
 wandb_run = wandb.init(project=wandb_project_name, name=wandb_exp_name, config=wandb_config)
 
@@ -389,6 +392,7 @@ if confidence_filter_enabled:
         adapter_name=confidence_adapter_name,
         candidate_token_ids=confidence_candidate_token_ids,
         group_size=group_size,
+        cache_predictions=True,
     )
 
 # Training loop

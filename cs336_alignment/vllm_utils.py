@@ -13,7 +13,7 @@ import subprocess
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, Sequence
 
 import torch
@@ -171,12 +171,44 @@ class VLLMServer:
         )
 
 
-@dataclass(frozen=True)
+@dataclass
 class VLLMConfidenceEstimator:
     server: VLLMServer
     adapter_name: str
     candidate_token_ids: tuple[int, ...]
     group_size: int
+    cache_predictions: bool = False
+    _cached_prompts: tuple[str, ...] | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
+    _cached_predictions: VLLMConfidencePredictions | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
+
+    def clear_cache(self) -> None:
+        self._cached_prompts = None
+        self._cached_predictions = None
+
+    def _result_with_cache_metrics(
+        self,
+        predictions: VLLMConfidencePredictions,
+        *,
+        cache_hit: bool,
+    ) -> VLLMConfidencePredictions:
+        metrics = dict(predictions.metrics)
+        metrics["cache_enabled"] = float(self.cache_predictions)
+        metrics["cache_hit"] = float(cache_hit)
+        if cache_hit:
+            metrics["inference_seconds"] = 0.0
+        return VLLMConfidencePredictions(
+            hard_confidences=list(predictions.hard_confidences),
+            expected_confidences=list(predictions.expected_confidences),
+            metrics=metrics,
+        )
 
     def predict_confidences(
         self,
@@ -184,12 +216,30 @@ class VLLMConfidenceEstimator:
         *,
         batch_size: int,
     ) -> VLLMConfidencePredictions:
-        return self.server.generate_confidence_predictions(
-            prompts,
+        prompt_key = tuple(prompts)
+        if (
+            self.cache_predictions
+            and prompt_key == self._cached_prompts
+            and self._cached_predictions is not None
+        ):
+            return self._result_with_cache_metrics(
+                self._cached_predictions,
+                cache_hit=True,
+            )
+
+        predictions = self.server.generate_confidence_predictions(
+            prompt_key,
             model_id=self.adapter_name,
             candidate_token_ids=self.candidate_token_ids,
             group_size=self.group_size,
             batch_size=batch_size,
+        )
+        if self.cache_predictions:
+            self._cached_prompts = prompt_key
+            self._cached_predictions = predictions
+        return self._result_with_cache_metrics(
+            predictions,
+            cache_hit=False,
         )
 
 
