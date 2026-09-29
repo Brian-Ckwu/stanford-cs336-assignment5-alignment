@@ -17,9 +17,11 @@ from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Protocol, Sequence, final
 
 try:
+    from .online_calibration import CalibrationObservation, OnlineScalarCalibrator, predictive_metrics
     from .confidence_training.metrics import compute_metrics
     from .grpo_core_implementation import score_rollout_responses
 except ImportError:
+    from online_calibration import CalibrationObservation, OnlineScalarCalibrator, predictive_metrics
     from confidence_training.metrics import compute_metrics
     from grpo_core_implementation import score_rollout_responses
 
@@ -73,6 +75,9 @@ class RolloutGroup:
     # instead set it to the estimator's prompt-level predicted accuracy.
     filter_score: float
     filter_score_source: str
+    raw_confidence: float | None = None
+    calibration_bias: float = 0.0
+    calibration_version: int = 0
 
 
 @dataclass(frozen=True)
@@ -86,6 +91,36 @@ class CollectedRolloutBatch:
     filter_score_sources: list[str]
     training_row_indices: list[int]
     metrics: dict[str, float]
+    group_raw_confidences: list[float | None] | None = None
+    calibration_bias: float = 0.0
+    calibration_version: int = 0
+
+    def calibration_observations(self, rollout_step: int, group_size: int) -> list[CalibrationObservation]:
+        """Snapshot the scores used for selection and their binary outcomes."""
+        if group_size <= 0 or self.group_raw_confidences is None:
+            raise ValueError("Confidence observations require raw scores and a positive group size")
+        count = len(self.training_row_indices)
+        if len(self.group_raw_confidences) != count or len(self.group_filter_scores) != count or len(self.reward_dicts) != count * group_size:
+            raise ValueError("Misaligned confidence batch metadata")
+        observations = []
+        for index, row_index in enumerate(self.training_row_indices):
+            raw = self.group_raw_confidences[index]
+            if raw is None:
+                raise ValueError("Missing raw confidence")
+            rewards = [float(row["reward"]) for row in self.reward_dicts[index * group_size : (index + 1) * group_size]]
+            if any(value not in (0.0, 1.0) for value in rewards):
+                raise ValueError("Confidence calibration requires binary rewards")
+            observations.append(CalibrationObservation(
+                rollout_step=rollout_step,
+                training_row_index=row_index,
+                raw_confidence=raw,
+                calibrated_confidence=self.group_filter_scores[index],
+                correct_count=int(sum(rewards)),
+                group_size=group_size,
+                bias_used=self.calibration_bias,
+                calibration_version=self.calibration_version,
+            ))
+        return observations
 
 
 class RolloutBatchCollector(ABC):
@@ -250,6 +285,9 @@ class RolloutBatchCollector(ABC):
         completions: Sequence[Completion],
         filter_score: float | None = None,
         filter_score_source: str = "empirical_reward",
+        raw_confidence: float | None = None,
+        calibration_bias: float = 0.0,
+        calibration_version: int = 0,
     ) -> RolloutGroup:
         """Score generated responses and materialize one rollout group.
 
@@ -295,6 +333,9 @@ class RolloutBatchCollector(ABC):
             candidate_index=candidate_index,
             filter_score=resolved_filter_score,
             filter_score_source=filter_score_source,
+            raw_confidence=raw_confidence,
+            calibration_bias=calibration_bias,
+            calibration_version=calibration_version,
         )
 
     def _flatten_groups(
@@ -325,6 +366,9 @@ class RolloutBatchCollector(ABC):
             filter_score_sources=[group.filter_score_source for group in groups],
             training_row_indices=[group.training_row_index for group in groups],
             metrics=metrics,
+            group_raw_confidences=[group.raw_confidence for group in groups],
+            calibration_bias=groups[0].calibration_bias,
+            calibration_version=groups[0].calibration_version,
         )
 
     @final
@@ -534,6 +578,7 @@ class ConfidenceEstimatorRolloutBatchCollector(RolloutBatchCollector):
         max_candidate_groups: int,
         confidence_batch_size: int,
         scheduler_seed: int | None = None,
+        calibrator: OnlineScalarCalibrator | None = None,
     ) -> None:
         super().__init__(
             rollout_server=rollout_server,
@@ -550,6 +595,7 @@ class ConfidenceEstimatorRolloutBatchCollector(RolloutBatchCollector):
         if confidence_batch_size <= 0:
             raise ValueError("confidence_batch_size must be positive")
         self.confidence_estimator = confidence_estimator
+        self.calibrator = calibrator
         self.confidence_batch_size = confidence_batch_size
         self.next_training_row_index = 0
         self.collection_step = 0
@@ -622,6 +668,14 @@ class ConfidenceEstimatorRolloutBatchCollector(RolloutBatchCollector):
         # XXX
         elapsed = time.perf_counter() - start
         print(f"Confidence estimation done {elapsed:.2f} seconds ({len(hard_confidences)} hard confidences, mean = {sum(hard_confidences) / len(hard_confidences)}; {len(expected_confidences)} expected confidences, mean = {sum(expected_confidences) / len(expected_confidences)})")  # XXX
+
+        application_start = time.perf_counter()
+        raw_confidences = expected_confidences
+        bias_used = self.calibrator.bias if self.calibrator is not None else 0.0
+        version_used = self.calibrator.version if self.calibrator is not None else 0
+        if self.calibrator is not None:
+            expected_confidences = self.calibrator.predict(raw_confidences)
+        application_seconds = time.perf_counter() - application_start
 
         accepted_candidates: list[tuple[int, int, float, float]] = []
         intermediate_reservoir: list[
@@ -732,19 +786,28 @@ class ConfidenceEstimatorRolloutBatchCollector(RolloutBatchCollector):
                 candidate_index=candidate_index,
                 completions=completions[start : start + self.group_size],
                 filter_score=expected_confidence,
-                filter_score_source="confidence_estimator_expected",
+                filter_score_source=(
+                    "confidence_estimator_calibrated" if self.calibrator is not None
+                    else "confidence_estimator_expected"
+                ),
+                raw_confidence=raw_confidences[training_row_index],
+                calibration_bias=bias_used,
+                calibration_version=version_used,
             )
+            if self.calibrator is not None and any(float(row["reward"]) not in (0.0, 1.0) for row in group.reward_dicts):
+                raise ValueError("Confidence calibration metrics require binary rewards")
             selected_groups.append(group)
             selected_hard_confidences.append(hard_confidence)
             selected_expected_confidences.append(expected_confidence)
 
         empirical_targets = [group.mean_reward for group in selected_groups]
+        selected_raw_confidences = [raw_confidences[group.training_row_index] for group in selected_groups]
         hard_metrics = compute_metrics(
             selected_hard_confidences,
             empirical_targets,
         )
         expected_metrics = compute_metrics(
-            selected_expected_confidences,
+            selected_raw_confidences,
             empirical_targets,
         )
         candidate_questions = len(considered_rows)
@@ -782,7 +845,20 @@ class ConfidenceEstimatorRolloutBatchCollector(RolloutBatchCollector):
             "calibration/expected_spearman_r": float(
                 expected_metrics["spearman_r"]
             ),
+            "selected_mean_raw_confidence": sum(selected_raw_confidences) / self.target_groups,
+            "raw_pool_in_range_fraction": sum(self.lower_bound <= p <= self.upper_bound for p in raw_confidences) / len(raw_confidences),
+            "calibrated_pool_in_range_fraction": sum(self.lower_bound <= p <= self.upper_bound for p in expected_confidences) / len(expected_confidences),
+            "all_zero_group_fraction": sum(y == 0 for y in empirical_targets) / self.target_groups,
+            "mixed_group_fraction": sum(0 < y < 1 for y in empirical_targets) / self.target_groups,
+            "all_one_group_fraction": sum(y == 1 for y in empirical_targets) / self.target_groups,
+            "calibration/online/bias_used": bias_used,
+            "calibration/online/version_used": float(version_used),
+            "time/calibration_application": application_seconds,
         }
+        for name, scores in (("raw", selected_raw_confidences), ("calibrated", selected_expected_confidences)):
+            score_metrics = predictive_metrics(scores, empirical_targets)
+            score_metrics["spearman_r"] = float(compute_metrics(scores, empirical_targets)["spearman_r"])
+            metrics.update({f"calibration/{name}/{key}": value for key, value in score_metrics.items()})
         metrics.update(
             {
                 f"confidence_{name}": float(value)

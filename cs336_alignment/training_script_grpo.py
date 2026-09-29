@@ -1,6 +1,16 @@
 import argparse
+import hashlib
 import json
+import time
+from dataclasses import asdict
 from pathlib import Path
+
+from online_calibration import (
+    BIAS_REGULARIZATION,
+    BIAS_TOLERANCE,
+    CONFIDENCE_EPSILON,
+    OnlineScalarCalibrator,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -48,6 +58,9 @@ def parse_args() -> argparse.Namespace:
         help="Prompt batch size for confidence-estimator inference.",
     )
     parser.add_argument("--difficulty-lower-bound", type=float, default=0.2)
+    parser.add_argument("--confidence-recalibration", choices=("none", "bias"), default="none")
+    parser.add_argument("--confidence-recalibration-warmup-steps", type=int, default=5)
+    parser.add_argument("--confidence-recalibration-history-steps", type=int, default=5)
     parser.add_argument("--difficulty-upper-bound", type=float, default=0.8)
     parser.add_argument(
         "--max-candidate-groups-multiplier",
@@ -176,6 +189,17 @@ confidence_estimator_lora_dir = (
     else Path(args.confidence_estimator_lora_dir).resolve()
 )
 confidence_estimator_batch_size = args.confidence_estimator_batch_size
+if args.confidence_recalibration == "bias" and args.difficulty_filter != "confidence-estimator":
+    raise ValueError("--confidence-recalibration bias requires --difficulty-filter confidence-estimator")
+if args.confidence_recalibration_warmup_steps <= 0 or args.confidence_recalibration_history_steps <= 0:
+    raise ValueError("Confidence recalibration warm-up and history lengths must be positive")
+confidence_calibrator = (
+    OnlineScalarCalibrator(
+        warmup_steps=args.confidence_recalibration_warmup_steps,
+        history_steps=args.confidence_recalibration_history_steps,
+    )
+    if args.confidence_recalibration == "bias" else None
+)
 
 if vllm_max_num_seqs <= 0:
     raise ValueError("--vllm-max-num-seqs must be positive")
@@ -262,7 +286,20 @@ import wandb
 wandb.login()
 wandb_config = {
     "lr": learning_rate,
+    "model_id": model_id,
+    "prompt_path": str(prompt_path),
     "seed": seed,
+    "group_size": group_size,
+    "train_batch_size": train_batch_size,
+    "sampling_params": sampling_params,
+    "validation_sampling_params": validation_sampling_params,
+    "confidence_recalibration": args.confidence_recalibration,
+    "confidence_recalibration_warmup_steps": args.confidence_recalibration_warmup_steps,
+    "confidence_recalibration_history_steps": args.confidence_recalibration_history_steps,
+    "confidence_recalibration_refit_interval": 1,
+    "confidence_recalibration_epsilon": CONFIDENCE_EPSILON,
+    "confidence_recalibration_regularization": BIAS_REGULARIZATION,
+    "confidence_recalibration_tolerance": BIAS_TOLERANCE,
     "difficulty_filter": args.difficulty_filter,
     "difficulty_lower_bound": args.difficulty_lower_bound,
     "difficulty_upper_bound": args.difficulty_upper_bound,
@@ -304,6 +341,28 @@ with open("../data/gsm8k/train.jsonl") as f:
 random.shuffle(full_dataset)
 train_dataset = full_dataset[:n_train_examples]
 valid_dataset = full_dataset[n_train_examples:n_train_examples+n_val_examples]
+
+calibration_observation_file = None
+if args.difficulty_filter == "confidence-estimator":
+    # Ordered row digests identify the exact pool without duplicating prompts.
+    row_hashes = [
+        hashlib.sha256(json.dumps(row, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+        for row in train_dataset
+    ]
+    pool_hash = hashlib.sha256(json.dumps(row_hashes).encode()).hexdigest()
+    identity_path = Path(wandb_run.dir) / "calibration_training_pool.json"
+    identity_path.write_text(json.dumps({
+        "schema_version": 1,
+        "source": "data/gsm8k/train.jsonl",
+        "row_hash_encoding": "sha256(json.dumps(row, sort_keys=True, ensure_ascii=False).encode('utf-8'))",
+        "ordered_row_sha256": row_hashes,
+        "pool_sha256": pool_hash,
+    }, indent=2))
+    wandb_run.config.update({"training_pool_sha256": pool_hash, "training_pool_size": len(train_dataset)})
+    wandb_run.save(str(identity_path), base_path=wandb_run.dir, policy="now")
+    observation_path = Path(wandb_run.dir) / "calibration_observations.jsonl"
+    calibration_observation_file = observation_path.open("a")
+    wandb_run.save(str(observation_path), base_path=wandb_run.dir, policy="live")
 
 if len(train_dataset) < train_batch_size // group_size:
     raise ValueError(
@@ -444,6 +503,7 @@ elif args.difficulty_filter == "confidence-estimator":
         ),
         confidence_batch_size=confidence_estimator_batch_size,
         scheduler_seed=seed,
+        calibrator=confidence_calibrator,
     )
 next_unfiltered_train_index = 0
 
@@ -451,6 +511,7 @@ from tqdm import tqdm
 
 # Validation before training
 from evaluation import evaluate
+training_start_time = time.perf_counter()
 validation_metrics = evaluate(
     vllm_server=llm_rollout,
     eval_dataset=valid_dataset,
@@ -461,10 +522,13 @@ validation_metrics = evaluate(
     cc_group_size=group_size if args.add_cc_sft_loss else None,
 )
 wandb_run.log(data={
-    **{f"valid/{key}": value for key, value in validation_metrics.items()}
+    **{f"valid/{key}": value for key, value in validation_metrics.items()},
+    "valid/elapsed_seconds": time.perf_counter() - training_start_time,
+    "time/training_elapsed": time.perf_counter() - training_start_time,
 }, step=0)
 
 for i in tqdm(range(num_rollout_steps), desc="GRPO training steps"):
+    iteration_start_time = time.perf_counter()
     time_metrics = {}
     collection_metrics = {}
     precomputed_reward_dicts = None
@@ -523,6 +587,10 @@ for i in tqdm(range(num_rollout_steps), desc="GRPO training steps"):
             responses = [completion.text for completion in completions]
 
     assert len(prompts) == len(responses) == len(answers) == train_batch_size
+    calibration_observations = (
+        collected_batch_for_recording.calibration_observations(i, group_size)
+        if calibration_observation_file is not None else None
+    )
     print(
         f"Successfully collected {len(responses)} training rollouts from "
         f"{len(prompts) // group_size} questions!"
@@ -562,6 +630,22 @@ for i in tqdm(range(num_rollout_steps), desc="GRPO training steps"):
         filtered_batch_collector.record_trained(
             collected_batch_for_recording
         )
+    if calibration_observations is not None:
+        for observation in calibration_observations:
+            calibration_observation_file.write(json.dumps(asdict(observation), allow_nan=False) + "\n")
+        calibration_observation_file.flush()
+        if confidence_calibrator is not None:
+            fit_start = time.perf_counter()
+            online_metrics = confidence_calibrator.observe_and_update(calibration_observations)
+            time_metrics["time/calibration_fit"] = time.perf_counter() - fit_start
+        else:
+            online_metrics = {
+                "bias_used": 0.0, "bias_next": 0.0, "bias_change": 0.0,
+                "version_used": 0.0, "version_next": 0.0, "fit_performed": 0.0,
+                "buffer_steps": 0.0, "buffer_groups": 0.0,
+            }
+            time_metrics["time/calibration_fit"] = 0.0
+        collection_metrics.update({f"calibration/online/{key}": value for key, value in online_metrics.items()})
     # Sync weights
     print("Syncing weights of the rollout LLM to be the same with the updated policy LLM...")
     sync_memory_metrics = {}
@@ -596,13 +680,14 @@ for i in tqdm(range(num_rollout_steps), desc="GRPO training steps"):
         **{
             (
                 key
-                if key.startswith("calibration/")
+                if key.startswith(("calibration/", "time/"))
                 else f"train/filter/{key}"
             ): value
             for key, value in collection_metrics.items()
         },
         **memory_metrics,
         **time_metrics,
+        "time/training_elapsed": time.perf_counter() - training_start_time,
     }, step=i)
     # Validation
     if ((i + 1) % 10 == 0) or (i == num_rollout_steps - 1):
@@ -616,15 +701,27 @@ for i in tqdm(range(num_rollout_steps), desc="GRPO training steps"):
             cc_group_size=group_size if args.add_cc_sft_loss else None,
         )
         wandb_run.log(data={
-            **{f"valid/{key}": value for key, value in validation_metrics.items()}
+            **{f"valid/{key}": value for key, value in validation_metrics.items()},
+            "valid/elapsed_seconds": time.perf_counter() - training_start_time,
+            "time/training_elapsed": time.perf_counter() - training_start_time,
         }, step=i)
+    wandb_run.log({
+        "time/training_iteration": time.perf_counter() - iteration_start_time,
+        "time/training_elapsed": time.perf_counter() - training_start_time,
+    }, step=i)
 
 # Closing
+if calibration_observation_file is not None:
+    calibration_observation_file.close()
 llm_rollout.stop()
 if runtime_adapter_dir is not None:
     runtime_adapter_dir.cleanup()
 
 output_dir = f"checkpoints/{wandb_exp_name}-final"
+if confidence_calibrator is not None:
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    calibration_state_path = Path(output_dir) / "online_calibration.json"
+    calibration_state_path.write_text(json.dumps(confidence_calibrator.state_dict(), indent=2, allow_nan=False))
 tokenizer.save_pretrained(output_dir)
 if use_peft and args.save_only_adapter:
     llm_policy.save_pretrained(output_dir, safe_serialization=True)
