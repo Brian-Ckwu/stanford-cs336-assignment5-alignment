@@ -1,6 +1,6 @@
 from contextlib import contextmanager
 import time
-from typing import Callable, Iterator, Literal
+from typing import Any, Callable, Iterator, Literal
 
 import torch
 import torch.nn.functional as F
@@ -239,9 +239,9 @@ def get_response_log_probs(
 
 
 def score_rollout_responses(
-    reward_fn: Callable[[str, str], dict[str, float]],
+    reward_fn: Callable[[str, Any], dict[str, float]],
     rollout_responses: list[str],
-    repeated_ground_truths: list[str],
+    repeated_ground_truths: list[Any],
 ) -> list[dict[str, float]]:
     """Grade each rollout response once and retain every reward component."""
     if len(rollout_responses) != len(repeated_ground_truths):
@@ -256,22 +256,22 @@ def score_rollout_responses(
 
 
 def compute_rollout_rewards(
-    reward_fn: Callable[[str, str], dict[str, float]],
+    reward_fn: Callable[[str, Any], dict[str, float]],
     rollout_responses: list[str],
-    repeated_ground_truths: list[str],
+    repeated_ground_truths: list[Any],
     precomputed_reward_dicts: list[dict[str, float]] | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Compute rewards for a list of rollout responses, along with metadata for
     the reward components.
 
     Args:
-        reward_fn: Callable[[str, str], dict[str, float]]
+        reward_fn: Callable[[str, Any], dict[str, float]]
             Scores the rollout responses against the ground truths, producing
             a dict with keys "reward", "format_reward", and "answer_reward".
         rollout_responses: list[str]
             Rollouts from the policy. The length of this list is
             rollout_batch_size = n_prompts_per_rollout_batch * group_size.
-        repeated_ground_truths: list[str]
+        repeated_ground_truths: list[Any]
             The ground truths for the examples. The length of this list is
             rollout_batch_size, because the ground truth for each example is
             repeated group_size times.
@@ -524,10 +524,10 @@ def grpo_train_step(
     optimizer: torch.optim.Optimizer,
     gradient_accumulation_steps: int,
     max_grad_norm: float | None,
-    reward_fn: Callable[[str, str], dict[str, float]],
+    reward_fn: Callable[[str, Any], dict[str, float]],
     repeated_prompts: list[str],
     rollout_responses: list[str],
-    repeated_ground_truths: list[str],
+    repeated_ground_truths: list[Any],
     group_size: int,
     baseline: Literal["mean", "none"] = "mean",
     advantage_eps: float = 1e-6,
@@ -558,7 +558,7 @@ def grpo_train_step(
         max_grad_norm: float | None
             If not None, clip the gradient norm to this value before calling
             optimizer.step().
-        reward_fn: Callable[[str, str], dict[str, float]]
+        reward_fn: Callable[[str, Any], dict[str, float]]
             Scores the rollout responses against the ground truths, producing
             a dict with keys "reward", "format_reward", and "answer_reward".
         repeated_prompts: list[str]
@@ -568,7 +568,7 @@ def grpo_train_step(
         rollout_responses: list[str]
             Rollouts from the policy. The length of this list is
             rollout_batch_size = n_prompts_per_rollout_batch * group_size.
-        repeated_ground_truths: list[str]
+        repeated_ground_truths: list[Any]
             The ground truths for the examples. The length of this list is
             rollout_batch_size, because the ground truth for each example is
             repeated group_size times.

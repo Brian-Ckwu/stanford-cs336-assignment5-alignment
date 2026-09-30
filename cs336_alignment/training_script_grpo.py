@@ -14,7 +14,7 @@ from online_calibration import (
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train OLMo with GRPO on GSM8K.")
+    parser = argparse.ArgumentParser(description="Train with GRPO on a given dataset (--dataset-folder).")
 
     parser.add_argument("--wandb-project-name", default="OLMo-2-0425-1B_GRPO_GSM8K")
     parser.add_argument(
@@ -25,7 +25,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--policy-device", type=int, default=2)
     parser.add_argument("--rollout-device", type=int, default=3)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
-    parser.add_argument("--prompt-path", default="prompts/r1_zero.prompt")
+    parser.add_argument(
+        "--dataset-folder",
+        default=str(Path(__file__).resolve().parents[1] / "data" / "gsm8k"),
+        help="Folder containing train.jsonl; validation is held out from this file.",
+    )
+    parser.add_argument(
+        "--prompt-path", default=None,
+        help="Override the dataset-specific default prompt.",
+    )
     parser.add_argument("--add-cc-sft-loss", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--cc-sft-loss-lambda", type=float, default=1.0)
     parser.add_argument("--n-train-examples", type=int, default=6400)
@@ -157,7 +165,10 @@ policy_device = args.policy_device
 rollout_device = args.rollout_device
 gpu_memory_utilization = args.gpu_memory_utilization
 weight_transfer_backend = "ipc" if policy_device == rollout_device else "nccl"
-prompt_path = args.prompt_path
+from grpo_data import load_rows, prepare_rows, resolve_prompt_path
+
+raw_dataset, dataset_name = load_rows(args.dataset_folder)
+prompt_path = resolve_prompt_path(args.prompt_path, dataset_name)
 n_train_examples = args.n_train_examples
 n_val_examples = args.n_val_examples
 num_rollout_steps = args.num_rollout_steps
@@ -288,6 +299,9 @@ wandb_config = {
     "lr": learning_rate,
     "model_id": model_id,
     "prompt_path": str(prompt_path),
+    "dataset": dataset_name,
+    "dataset_folder": str(Path(args.dataset_folder).resolve()),
+    "dataset_source": str((Path(args.dataset_folder) / "train.jsonl").resolve()),
     "seed": seed,
     "group_size": group_size,
     "train_batch_size": train_batch_size,
@@ -331,13 +345,8 @@ random.seed(seed)
 with open(prompt_path) as f:
     prompt_template = f.read()
 
-full_dataset = list()
-with open("../data/gsm8k/train.jsonl") as f:
-    for line in f:
-        row = json.loads(line)
-        row["prompt"] = prompt_template.replace("{question}", row["question"]).replace("{group_size}", str(group_size))  # NOTE: group_size in the prompt is meant for the cc loss
-        row["answer"] = row["answer"].split("####")[-1].strip()
-        full_dataset.append(row)
+full_dataset = prepare_rows(raw_dataset, dataset_name, prompt_template, group_size)
+del raw_dataset
 random.shuffle(full_dataset)
 train_dataset = full_dataset[:n_train_examples]
 valid_dataset = full_dataset[n_train_examples:n_train_examples+n_val_examples]
@@ -353,7 +362,7 @@ if args.difficulty_filter == "confidence-estimator":
     identity_path = Path(wandb_run.dir) / "calibration_training_pool.json"
     identity_path.write_text(json.dumps({
         "schema_version": 1,
-        "source": "data/gsm8k/train.jsonl",
+        "source": str((Path(args.dataset_folder) / "train.jsonl").resolve()),
         "row_hash_encoding": "sha256(json.dumps(row, sort_keys=True, ensure_ascii=False).encode('utf-8'))",
         "ordered_row_sha256": row_hashes,
         "pool_sha256": pool_hash,
@@ -457,6 +466,9 @@ if confidence_filter_enabled:
 # Training loop
 from grpo_core_implementation import grpo_train_step, track_cuda_memory_and_time
 from drgrpo_grader import r1_zero_reward_fn
+from triviaqa import triviaqa_reward_fn
+
+reward_fn = triviaqa_reward_fn if dataset_name == "triviaqa" else r1_zero_reward_fn
 from rollout_batch_collection import (
     ConfidenceEstimatorRolloutBatchCollector,
     EmpiricalRewardRolloutBatchCollector,
@@ -474,7 +486,7 @@ if args.difficulty_filter == "empirical-reward":
     filtered_batch_collector = EmpiricalRewardRolloutBatchCollector(
         rollout_server=llm_rollout,
         train_rows=train_dataset,
-        reward_fn=r1_zero_reward_fn,
+        reward_fn=reward_fn,
         sampling_params=sampling_params,
         train_batch_size=train_batch_size,
         group_size=group_size,
@@ -490,7 +502,7 @@ elif args.difficulty_filter == "confidence-estimator":
     filtered_batch_collector = ConfidenceEstimatorRolloutBatchCollector(
         rollout_server=llm_rollout,
         train_rows=train_dataset,
-        reward_fn=r1_zero_reward_fn,
+        reward_fn=reward_fn,
         confidence_estimator=confidence_estimator,
         sampling_params=sampling_params,
         train_batch_size=train_batch_size,
@@ -517,7 +529,7 @@ validation_metrics = evaluate(
     eval_dataset=valid_dataset,
     sampling_params=validation_sampling_params,
     batch_size=args.valid_batch_size,
-    reward_fn=r1_zero_reward_fn,
+    reward_fn=reward_fn,
     tokenizer=tokenizer if args.add_cc_sft_loss else None,
     cc_group_size=group_size if args.add_cc_sft_loss else None,
 )
@@ -563,10 +575,9 @@ for i in tqdm(range(num_rollout_steps), desc="GRPO training steps"):
             ) % len(train_dataset)
             print(
                 f"Generating rollouts for the following {len(train_rows)} "
-                "questions (answers): ",
+                "questions: ",
                 [
                     train_row["question"].split()[0]
-                    + f" ({train_row['answer']})"
                     for train_row in train_rows
                 ],
             )
@@ -615,7 +626,7 @@ for i in tqdm(range(num_rollout_steps), desc="GRPO training steps"):
             optimizer=optimizer,
             gradient_accumulation_steps=gradient_accumulation_steps,
             max_grad_norm=max_grad_norm,
-            reward_fn=r1_zero_reward_fn,
+            reward_fn=reward_fn,
             repeated_prompts=prompts,
             rollout_responses=responses,
             repeated_ground_truths=answers,
@@ -696,7 +707,7 @@ for i in tqdm(range(num_rollout_steps), desc="GRPO training steps"):
             eval_dataset=valid_dataset,
             sampling_params=validation_sampling_params,
             batch_size=args.valid_batch_size,
-            reward_fn=r1_zero_reward_fn,
+            reward_fn=reward_fn,
             tokenizer=tokenizer if args.add_cc_sft_loss else None,
             cc_group_size=group_size if args.add_cc_sft_loss else None,
         )

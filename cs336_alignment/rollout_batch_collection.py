@@ -64,7 +64,7 @@ class ConfidenceEstimator(Protocol):
 class RolloutGroup:
     training_row_index: int
     prompt: str
-    ground_truth: str
+    ground_truth: Any
     responses: list[str]
     reward_dicts: list[dict[str, float]]
     # This is always measured from the generated responses and is what GRPO
@@ -84,7 +84,7 @@ class RolloutGroup:
 class CollectedRolloutBatch:
     repeated_prompts: list[str]
     rollout_responses: list[str]
-    repeated_ground_truths: list[str]
+    repeated_ground_truths: list[Any]
     reward_dicts: list[dict[str, float]]
     group_mean_rewards: list[float]
     group_filter_scores: list[float]
@@ -142,7 +142,7 @@ class RolloutBatchCollector(ABC):
         *,
         rollout_server: RolloutServer,
         train_rows: Sequence[Mapping[str, Any]],
-        reward_fn: Callable[[str, str], dict[str, float]],
+        reward_fn: Callable[[str, Any], dict[str, float]],
         sampling_params: Mapping[str, Any],
         train_batch_size: int,
         group_size: int,
@@ -299,7 +299,7 @@ class RolloutBatchCollector(ABC):
         row = self.train_rows[training_row_index]
         try:
             prompt = str(row["prompt"])
-            ground_truth = str(row["answer"])
+            ground_truth = row["answer"]
         except KeyError as error:
             raise ValueError(
                 f"Every training row must contain {error.args[0]!r}"
@@ -568,7 +568,7 @@ class ConfidenceEstimatorRolloutBatchCollector(RolloutBatchCollector):
         *,
         rollout_server: RolloutServer,
         train_rows: Sequence[Mapping[str, Any]],
-        reward_fn: Callable[[str, str], dict[str, float]],
+        reward_fn: Callable[[str, Any], dict[str, float]],
         confidence_estimator: ConfidenceEstimator,
         sampling_params: Mapping[str, Any],
         train_batch_size: int,
